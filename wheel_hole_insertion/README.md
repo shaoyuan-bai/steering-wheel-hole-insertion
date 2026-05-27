@@ -12,6 +12,7 @@
   - `stability_verify_A_reprocessed/base_mean_preinsert_plan_corrected.json`：右 2.5 mm，上 3.0 mm。
   - `stability_verify_A_reprocessed/base_mean_preinsert_plan_corrected_r45_u30.json`：右 4.5 mm，上 3.0 mm。
 - 已实现内网 RealSense 前端 `realsense_preview_server.py`，支持彩色预览、截图和“回初始位置”按钮。
+- 已实现现场一键流程 `run_live_yolo_preinsert.py`：每次重新拍照、YOLO 识别、移动到预插入、移动到 YOLO 终点、再沿插入轴额外前伸。
 - 现场验证 A 的有效样本显示中心点约 3 mm 级稳定，法向约 0.22 度稳定；后续重点是 TCP/插入杆偏置补偿和避开奇异位姿。
 
 ## 思路
@@ -26,6 +27,37 @@
    - `final_pose`：沿孔轴短直线插入后的点。
 
 ## 运行
+
+当前推荐现场启动方式：
+
+```bash
+/home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/run_live_yolo_preinsert.py
+```
+
+默认每一步都会询问是否继续：
+
+1. 实时拍照 + YOLO 识别。
+2. 移动到预插入位置。
+3. 移动到 YOLO 计划终点。
+4. 无视 YOLO 终点，沿插入轴继续前伸 30 mm。
+
+如果需要自动执行完整流程：
+
+```bash
+/home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/run_live_yolo_preinsert.py -y
+```
+
+当前默认补偿是“从机械臂朝孔看，右 2.5 mm、上 3.0 mm”：
+
+```bash
+--right-offset-m 0.0025 --up-offset-m 0.0030
+```
+
+额外前伸默认 30 mm，可调整：
+
+```bash
+--extra-insert-m 0.030
+```
 
 默认只规划，不发运动：
 

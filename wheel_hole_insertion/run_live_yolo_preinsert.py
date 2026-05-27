@@ -1,0 +1,190 @@
+# -*- coding: utf-8 -*-
+"""Live workflow: YOLO detect, preinsert, move to YOLO final, then extra insert."""
+
+import argparse
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT = SCRIPT_DIR.parent
+DEFAULT_PYTHON = "/home/wooshrobot/miniconda3/envs/cyy/bin/python"
+
+
+def run(cmd, capture_stdout=False):
+    print("\n[CMD]", " ".join(str(x) for x in cmd))
+    if capture_stdout:
+        proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
+        if proc.stdout:
+            print(proc.stdout, end="")
+        if proc.stderr:
+            print(proc.stderr, end="", file=sys.stderr)
+        return proc.stdout
+    subprocess.run(cmd, check=True)
+    return ""
+
+
+def confirm_or_skip(prompt, yes):
+    if yes:
+        print(f"[AUTO] {prompt}")
+        return True
+    answer = input(f"{prompt} 输入 y 继续，其他键跳过/停止: ").strip().lower()
+    return answer == "y"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--python", default=DEFAULT_PYTHON)
+    parser.add_argument("--serial", default="")
+    parser.add_argument("--width", type=int, default=1280)
+    parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--warmup", type=int, default=30)
+    parser.add_argument("--out-root", default=str(SCRIPT_DIR / "live_runs"))
+    parser.add_argument("--right-offset-m", type=float, default=0.0025,
+                        help="Observed rod offset to the right of hole; target compensates left.")
+    parser.add_argument("--up-offset-m", type=float, default=0.0030,
+                        help="Observed rod offset above hole; target compensates down.")
+    parser.add_argument("--tcp-to-tip-m", type=float, default=0.20)
+    parser.add_argument("--preinsert-distance-m", type=float, default=0.08)
+    parser.add_argument("--insert-depth-m", type=float, default=0.002)
+    parser.add_argument("--max-preinsert-move-m", type=float, default=0.35)
+    parser.add_argument("--max-insert-move-m", type=float, default=0.10)
+    parser.add_argument("--max-insert-depth-m", type=float, default=0.003)
+    parser.add_argument("--extra-insert-m", type=float, default=0.030,
+                        help="Extra distance to continue past the YOLO final pose along insertion axis.")
+    parser.add_argument("--movej-speed", type=int, default=2)
+    parser.add_argument("--movel-speed", type=int, default=1)
+    parser.add_argument("--max-j6-step-deg", type=float, default=90.0)
+    parser.add_argument("--allow-non-ok-quality", action="store_true", default=True)
+    parser.add_argument("--require-quality-ok", action="store_true",
+                        help="Require detector quality ok before moving.")
+    parser.add_argument("--no-move", action="store_true",
+                        help="Only capture, detect, and plan. Do not move.")
+    parser.add_argument("--no-stop-key", action="store_true",
+                        help="Disable keyboard stop watcher in the movement subprocess.")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Automatically execute all motion stages without confirmation prompts.")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    run_root = Path(args.out_root).expanduser().resolve() / f"run_{ts}"
+    capture_root = run_root / "capture"
+    result_root = run_root / "result"
+    capture_root.mkdir(parents=True, exist_ok=True)
+    result_root.mkdir(parents=True, exist_ok=True)
+
+    capture_cmd = [
+        args.python,
+        str(SCRIPT_DIR / "capture_rgbd_once_headless.py"),
+        "--out", str(capture_root),
+        "--width", str(args.width),
+        "--height", str(args.height),
+        "--fps", str(args.fps),
+        "--warmup", str(args.warmup),
+    ]
+    if args.serial:
+        capture_cmd.extend(["--serial", args.serial])
+    stdout = run(capture_cmd, capture_stdout=True)
+    capture_lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if not capture_lines:
+        raise RuntimeError("Capture command did not print capture directory.")
+    capture_dir = Path(capture_lines[-1]).expanduser().resolve()
+
+    stem = f"live_yolo_{ts}"
+    detect_cmd = [
+        args.python,
+        str(SCRIPT_DIR / "detect_center_hole_yolo_rgbd.py"),
+        str(capture_dir),
+        "--out-dir", str(result_root),
+        "--out-stem", stem,
+        "--min-confidence", "0.35",
+    ]
+    run(detect_cmd)
+    detection_json = result_root / f"{stem}_detection.json"
+    plan_json = result_root / f"{stem}_plan.json"
+
+    plan_cmd = [
+        args.python,
+        str(SCRIPT_DIR / "move_to_center_hole.py"),
+        "--detection", str(detection_json),
+        "--observed-right-offset-m", str(args.right_offset_m),
+        "--observed-up-offset-m", str(args.up_offset_m),
+        "--tcp-to-tip-m", str(args.tcp_to_tip_m),
+        "--preinsert-distance-m", str(args.preinsert_distance_m),
+        "--insert-depth-m", str(args.insert_depth_m),
+        "--max-preinsert-move-m", str(args.max_preinsert_move_m),
+        "--movej-speed", str(args.movej_speed),
+        "--movel-speed", str(args.movel_speed),
+        "--max-j6-step-deg", str(args.max_j6_step_deg),
+        "--plan-out", str(plan_json),
+    ]
+    if args.require_quality_ok:
+        plan_cmd.append("--require-quality-ok")
+    elif args.allow_non_ok_quality:
+        plan_cmd.append("--allow-non-ok-quality")
+
+    if args.no_move:
+        run(plan_cmd)
+        print("\n[OK] live run directory:", run_root)
+        print("[OK] detection:", detection_json)
+        print("[OK] plan:", plan_json)
+        return
+
+    if confirm_or_skip("步骤 1/3：移动到预插入位置", args.yes):
+        preinsert_cmd = list(plan_cmd)
+        preinsert_cmd.append("--move-preinsert")
+        if not args.no_stop_key:
+            preinsert_cmd.append("--watch-stop-key")
+        run(preinsert_cmd)
+    else:
+        print("[STOP] 用户未确认预插入，流程停止。")
+        return
+
+    if confirm_or_skip("步骤 2/3：沿 YOLO 计划移动到 final_pose", args.yes):
+        final_cmd = [
+            args.python,
+            str(SCRIPT_DIR / "move_to_center_hole.py"),
+            "--plan-in", str(plan_json),
+            "--insert",
+            "--max-insert-move-m", str(args.max_insert_move_m),
+            "--max-insert-depth-m", str(args.max_insert_depth_m),
+            "--movel-speed", str(args.movel_speed),
+        ]
+        if args.allow_non_ok_quality and not args.require_quality_ok:
+            final_cmd.append("--allow-non-ok-quality")
+        if not args.no_stop_key:
+            final_cmd.append("--watch-stop-key")
+        run(final_cmd)
+    else:
+        print("[STOP] 用户未确认移动到 YOLO 终点，流程停止。")
+        return
+
+    if confirm_or_skip(f"步骤 3/3：无视 YOLO 终点继续前伸 {args.extra_insert_m * 1000.0:.1f} mm", args.yes):
+        extra_cmd = [
+            args.python,
+            str(SCRIPT_DIR / "continue_insert_along_axis.py"),
+            "--plan", str(plan_json),
+            "--distance-m", str(args.extra_insert_m),
+            "--max-distance-m", str(args.extra_insert_m),
+            "--speed", str(args.movel_speed),
+        ]
+        if not args.no_stop_key:
+            extra_cmd.append("--watch-stop-key")
+        run(extra_cmd)
+    else:
+        print("[STOP] 用户未确认额外前伸，流程停止。")
+        return
+
+    print("\n[OK] live run directory:", run_root)
+    print("[OK] detection:", detection_json)
+    print("[OK] plan:", plan_json)
+
+
+if __name__ == "__main__":
+    main()
