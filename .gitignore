@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local logs and SDK web logs
+libs/web-log*
+*.log
+
+# Large local RGBD captures and generated validation overlays
+wheel_hole_insertion/captures/
+wheel_hole_insertion/label_dataset/depth_m/
+wheel_hole_insertion/label_dataset/images/
+wheel_hole_insertion/label_dataset/meta/
+wheel_hole_insertion/preview_snapshots/
+wheel_hole_insertion/stability_verify_A/captures/
+wheel_hole_insertion/stability_verify_A_reprocessed/captures/
+wheel_hole_insertion/stability_verify_A_reprocessed/detections/
+wheel_hole_insertion/yolo_mask_validation/
+wheel_hole_insertion/yolo_rgbd_validation/
+
+# Keep deployment ONNX, ignore training checkpoint by default
+wheel_hole_insertion/label_dataset/best.pt

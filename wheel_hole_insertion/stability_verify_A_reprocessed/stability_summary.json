@@ -1,0 +1,168 @@
+{
+  "script_version": "2026-05-26-center-stability-v1",
+  "sample_count": 3,
+  "valid_count": 2,
+  "samples": [
+    {
+      "index": 1,
+      "ok": true,
+      "capture_dir": "/home/wooshrobot/bai/hand_eye_calibration/wheel_hole_insertion/stability_verify_A/captures/wrist_rgbd_20260526_175944",
+      "detection_path": "/home/wooshrobot/bai/hand_eye_calibration/wheel_hole_insertion/stability_verify_A_reprocessed/detections/sample_01_detection.json",
+      "overlay_path": "/home/wooshrobot/bai/hand_eye_calibration/wheel_hole_insertion/stability_verify_A_reprocessed/detections/sample_01_overlay.png",
+      "pose_now": [
+        -0.387,
+        -0.253916,
+        0.143841,
+        -2.608,
+        -1.183,
+        -1.797
+      ],
+      "joint_now": [
+        14.129,
+        83.681,
+        26.483,
+        -109.637,
+        -88.343,
+        -99.067
+      ],
+      "quality": "ok",
+      "quality_reasons": [],
+      "score": 0.553031861782074,
+      "center_px": [
+        666.7167192429022,
+        454.1852085524009
+      ],
+      "center_headcam_m": [
+        0.003479696493655123,
+        0.03362600178717562,
+        0.35747617507677026
+      ],
+      "normal_headcam": [
+        -0.07336847737542702,
+        0.19897906934864434,
+        -0.9772534965344248
+      ],
+      "center_base_m": [
+        -0.18888400719335516,
+        -0.599116716579687,
+        0.03415365930956665
+      ],
+      "normal_base": [
+        -0.4147105739835906,
+        0.8999860601582012,
+        0.13431392834371098
+      ],
+      "insert_axis_base": [
+        0.4147105739835906,
+        -0.8999860601582012,
+        -0.13431392834371098
+      ],
+      "plane_rmse_m": 0.0011137507953833978,
+      "plane_points": 23643,
+      "plane_inliers": 19052
+    },
+    {
+      "index": 2,
+      "ok": true,
+      "capture_dir": "/home/wooshrobot/bai/hand_eye_calibration/wheel_hole_insertion/stability_verify_A/captures/wrist_rgbd_20260526_180011",
+      "detection_path": "/home/wooshrobot/bai/hand_eye_calibration/wheel_hole_insertion/stability_verify_A_reprocessed/detections/sample_02_detection.json",
+      "overlay_path": "/home/wooshrobot/bai/hand_eye_calibration/wheel_hole_insertion/stability_verify_A_reprocessed/detections/sample_02_overlay.png",
+      "pose_now": [
+        -0.338641,
+        -0.232845,
+        0.035238,
+        -1.951,
+        -1.299,
+        -2.664
+      ],
+      "joint_now": [
+        11.646,
+        92.005,
+        57.135,
+        -88.295,
+        -82.328,
+        -134.531
+      ],
+      "quality": "ok",
+      "quality_reasons": [],
+      "score": 0.7876816391944885,
+      "center_px": [
+        622.4442138038402,
+        371.6452170904688
+      ],
+      "center_headcam_m": [
+        -0.012838484200295333,
+        0.00101286207101017,
+        0.32906789008448084
+      ],
+      "normal_headcam": [
+        0.26717859123717375,
+        0.1781076512547355,
+        -0.9470444894243569
+      ],
+      "center_base_m": [
+        -0.19392296802248343,
+        -0.5988604787781142,
+        0.037935037599168116
+      ],
+      "normal_base": [
+        -0.41997089586076425,
+        0.8968483128967938,
+        0.13887962515819893
+      ],
+      "insert_axis_base": [
+        0.41997089586076425,
+        -0.8968483128967938,
+        -0.13887962515819893
+      ],
+      "plane_rmse_m": 0.0010764318486071872,
+      "plane_points": 31796,
+      "plane_inliers": 27828
+    },
+    {
+      "index": 3,
+      "ok": false,
+      "capture_dir": "/home/wooshrobot/bai/hand_eye_calibration/wheel_hole_insertion/stability_verify_A/captures/wrist_rgbd_20260526_180041",
+      "pose_now": [
+        -0.371006,
+        -0.296908,
+        0.126275,
+        2.542,
+        -1.198,
+        -0.776
+      ],
+      "joint_now": [
+        20.14,
+        77.533,
+        47.688,
+        -98.574,
+        -71.324,
+        -134.545
+      ],
+      "error": "YOLO center_hole mask was not found."
+    }
+  ],
+  "center_base_mean_m": [
+    -0.1914034876079193,
+    -0.5989885976789007,
+    0.03604434845436738
+  ],
+  "center_error_mm": {
+    "rms": 3.152602330516539,
+    "max": 3.152602330516546,
+    "std_xyz": [
+      2.5194804145641374,
+      0.1281189007864003,
+      1.8906891448007315
+    ]
+  },
+  "normal_base_mean": [
+    -0.41734377956213586,
+    0.8984237407807408,
+    0.1365977732700337
+  ],
+  "normal_angle_deg": {
+    "mean": 0.21885621964858898,
+    "max": 0.21885621964942165
+  }
+}
