@@ -37,14 +37,27 @@
 默认每一步都会询问是否继续：
 
 1. 实时拍照 + YOLO 识别。
-2. 移动到预插入位置。
-3. 移动到 YOLO 计划终点。
-4. 无视 YOLO 终点，沿插入轴继续前伸 30 mm。
+2. 默认先自动回到保存的初始关节位姿，不需要确认。
+3. 移动到预插入位置。
+4. 移动到 YOLO 计划终点。
+5. 无视 YOLO 终点，沿插入轴继续前伸 30 mm。
 
 如果需要自动执行完整流程：
 
 ```bash
 /home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/run_live_yolo_preinsert.py -y
+```
+
+脚本默认会用较低的 YOLO 候选阈值生成检测图，但仍要求 `quality: ok` 才运动。如果现场 overlay 人工确认无误但质量被拒绝，可以显式加：
+
+```bash
+--allow-non-ok-quality
+```
+
+如果只是调试当前相机位姿，不想先回初始位置：
+
+```bash
+/home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/run_live_yolo_preinsert.py --skip-initial
 ```
 
 当前默认补偿是“从机械臂朝孔看，右 2.5 mm、上 3.0 mm”：

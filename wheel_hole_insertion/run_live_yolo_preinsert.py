@@ -11,16 +11,19 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
 DEFAULT_PYTHON = "/home/wooshrobot/miniconda3/envs/cyy/bin/python"
+INITIAL_JOINT_DEG = [-9.144, 72.947, 94.574, -99.437, -88.530, -154.118]
 
 
 def run(cmd, capture_stdout=False):
     print("\n[CMD]", " ".join(str(x) for x in cmd))
     if capture_stdout:
-        proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
+        proc = subprocess.run(cmd, check=False, text=True, capture_output=True)
         if proc.stdout:
             print(proc.stdout, end="")
         if proc.stderr:
             print(proc.stderr, end="", file=sys.stderr)
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, proc.args, output=proc.stdout, stderr=proc.stderr)
         return proc.stdout
     subprocess.run(cmd, check=True)
     return ""
@@ -34,6 +37,29 @@ def confirm_or_skip(prompt, yes):
     return answer == "y"
 
 
+def move_to_initial(args):
+    sys.path.insert(0, str(ROOT))
+    from rm65_sdk_safe_ik import Rm65SafeIkMover
+
+    print("\n[INIT] move to saved initial joint before capture")
+    print("[INIT] target joint:", INITIAL_JOINT_DEG)
+    mover = Rm65SafeIkMover(
+        robot_ip=args.robot_ip,
+        robot_port=args.robot_port,
+        speed=args.initial_movej_speed,
+        max_joint_step_deg=120,
+        max_j6_step_deg=120,
+    )
+    try:
+        mover.connect()
+        ret = mover.movej(INITIAL_JOINT_DEG)
+        print(f"[INIT] movej ret={ret}")
+        if ret != 0:
+            raise RuntimeError(f"Initial move failed, ret={ret}")
+    finally:
+        mover.close()
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--python", default=DEFAULT_PYTHON)
@@ -43,6 +69,15 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--out-root", default=str(SCRIPT_DIR / "live_runs"))
+    parser.add_argument("--yolo-conf", type=float, default=0.05,
+                        help="Low-level YOLO candidate threshold. Lower values help produce an overlay for review.")
+    parser.add_argument("--min-confidence", type=float, default=0.35,
+                        help="Quality threshold used by detection JSON before motion planning.")
+    parser.add_argument("--robot-ip", default="169.254.128.21")
+    parser.add_argument("--robot-port", type=int, default=8080)
+    parser.add_argument("--initial-movej-speed", type=int, default=5)
+    parser.add_argument("--skip-initial", action="store_true",
+                        help="Do not move to the saved initial joint before capture.")
     parser.add_argument("--right-offset-m", type=float, default=0.0025,
                         help="Observed rod offset to the right of hole; target compensates left.")
     parser.add_argument("--up-offset-m", type=float, default=0.0030,
@@ -58,7 +93,7 @@ def parse_args():
     parser.add_argument("--movej-speed", type=int, default=2)
     parser.add_argument("--movel-speed", type=int, default=1)
     parser.add_argument("--max-j6-step-deg", type=float, default=90.0)
-    parser.add_argument("--allow-non-ok-quality", action="store_true", default=True)
+    parser.add_argument("--allow-non-ok-quality", action="store_true")
     parser.add_argument("--require-quality-ok", action="store_true",
                         help="Require detector quality ok before moving.")
     parser.add_argument("--no-move", action="store_true",
@@ -78,6 +113,9 @@ def main():
     result_root = run_root / "result"
     capture_root.mkdir(parents=True, exist_ok=True)
     result_root.mkdir(parents=True, exist_ok=True)
+
+    if not args.skip_initial:
+        move_to_initial(args)
 
     capture_cmd = [
         args.python,
@@ -103,7 +141,8 @@ def main():
         str(capture_dir),
         "--out-dir", str(result_root),
         "--out-stem", stem,
-        "--min-confidence", "0.35",
+        "--conf", str(args.yolo_conf),
+        "--min-confidence", str(args.min_confidence),
     ]
     run(detect_cmd)
     detection_json = result_root / f"{stem}_detection.json"
@@ -124,9 +163,9 @@ def main():
         "--max-j6-step-deg", str(args.max_j6_step_deg),
         "--plan-out", str(plan_json),
     ]
-    if args.require_quality_ok:
+    if args.require_quality_ok or not args.allow_non_ok_quality:
         plan_cmd.append("--require-quality-ok")
-    elif args.allow_non_ok_quality:
+    else:
         plan_cmd.append("--allow-non-ok-quality")
 
     if args.no_move:
