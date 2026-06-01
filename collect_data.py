@@ -17,6 +17,54 @@ cam0_origin_path = create_folder_with_date() # 提前建立好的存储照片文
 logger_ = logging.getLogger(__name__)
 logger_ = CommonLog(logger_)
 
+
+def decode_json_stream(text):
+    decoder = json.JSONDecoder()
+    objects = []
+    idx = 0
+    while idx < len(text):
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
+        if idx >= len(text):
+            break
+        try:
+            obj, end = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            next_line = text.find("\n", idx)
+            if next_line < 0:
+                break
+            idx = next_line + 1
+            continue
+        objects.append(obj)
+        idx += end
+    return objects
+
+
+def recv_json_response(client, timeout_s=1.0, target_state=None):
+    old_timeout = client.gettimeout()
+    client.settimeout(timeout_s)
+    chunks = []
+    deadline = time.time() + timeout_s
+    try:
+        while time.time() < deadline:
+            try:
+                chunk = client.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            text = b"".join(chunks).decode("utf-8", "ignore")
+            objects = decode_json_stream(text)
+            if objects and target_state is None:
+                return text
+            if target_state is not None and any(obj.get("state") == target_state for obj in objects):
+                return text
+    finally:
+        client.settimeout(old_timeout)
+    return b"".join(chunks).decode("utf-8", "ignore")
+
+
 def callback(frame):
 
     scaling_factor = 2.0
@@ -44,7 +92,7 @@ def callback(frame):
                 f.write(new_line)
 
             image_path = os.path.join(cam0_origin_path,f"{str(count)}.jpg")
-            cv2.imwrite(image_path , cv_img)
+            cv2.imwrite(image_path, frame)
             logger_.info(f"===采集第{count}次数据！")
 
         count += 1
@@ -69,32 +117,16 @@ def send_cmd(client, cmd, get_pose=True):
     client.send(cmd.encode('utf-8'))
 
     if not get_pose:
-        response = client.recv(1024).decode('utf-8')
+        response = recv_json_response(client, timeout_s=1.0)
         logger_.info(f"response:{response}")
         return True
 
     time.sleep(0.1)
-    response = client.recv(4096).decode('utf-8')  # 增大接收缓冲区
+    response = recv_json_response(client, timeout_s=1.0, target_state="current_arm_state")
     logger_.info(f'response:{response}')
 
     try:
-        decoder = json.JSONDecoder()
-        data_list = []
-        index = 0
-        # 分割并解析所有可能的JSON对象
-        while index < len(response):
-            try:
-                # 跳过空白字符
-                while index < len(response) and response[index].isspace():
-                    index += 1
-                if index >= len(response):
-                    break
-                obj, idx = decoder.raw_decode(response[index:])
-                data_list.append(obj)
-                index += idx
-            except json.JSONDecodeError as e:
-                logger_.error(f"JSON解析错误：{str(e)}")
-                break
+        data_list = decode_json_stream(response)
 
         # 寻找最后一个包含目标状态的响应
         target_data = None
@@ -167,7 +199,7 @@ def displayD435():
 
 if __name__ == '__main__':
 
-    robot_ip = get_ip()
+    robot_ip = "169.254.128.21"
 
 
 

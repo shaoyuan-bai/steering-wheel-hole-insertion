@@ -128,8 +128,11 @@ def _make_ik_params(q_now, target_pose):
     except TypeError:
         try:
             params.q_pose = cast(pose_arr, POINTER(c_float))
-        except TypeError:
-            params.q_pose = _pose_to_rm_pose(pose)
+        except TypeError as exc:
+            raise TypeError(
+                "Unsupported rm_inverse_kinematics_params_t.q_pose type. "
+                "Expected a float array or float pointer; refusing to assign rm_pose_t."
+            ) from exc
 
     params.flag = 1
     params._q_in_array = q_arr
@@ -208,12 +211,12 @@ class Rm65SafeIkMover:
         arm_model = rm_robot_arm_model_e.RM_MODEL_RM_65_E  # noqa: F405
         try:
             force_type = getattr(rm_force_type_e, self.force_type_name)  # noqa: F405
-        except AttributeError:
-            print(
-                f"[SDK WARN] force type {self.force_type_name!r} not found; "
-                "falling back to RM_MODEL_RM_B_E. Please confirm your RM65-BF SDK enum."
-            )
-            force_type = rm_force_type_e.RM_MODEL_RM_B_E  # noqa: F405
+        except AttributeError as exc:
+            raise RuntimeError(
+                f"SDK force type {self.force_type_name!r} not found. "
+                "Refusing to fall back to another robot force model; check "
+                "wheel_hole_insertion/config.yaml or the installed RM_API2 enum."
+            ) from exc
         self.algo = Algo(arm_model, force_type)  # noqa: F405
 
         if hasattr(self.algo, "rm_algo_set_redundant_parameter_traversal_mode"):
@@ -236,6 +239,10 @@ class Rm65SafeIkMover:
                 self.algo = None
                 self.handle = None
 
+    def reconnect(self):
+        self.close()
+        self.connect()
+
     def solve_best_joint(self, current_joint_deg, target_pose):
         """
         Return (best_joint, diagnostics).
@@ -257,10 +264,23 @@ class Rm65SafeIkMover:
             "rejected": [],
         }
 
-        if getattr(result, "result", 1) != 0:
-            return None, diagnostics
+        candidates = []
+        if getattr(result, "result", 1) == 0:
+            candidates.extend(list(getattr(result, "q_solve", [])))
+        else:
+            diagnostics["rejected"].append(("all-ik", f"result-{getattr(result, 'result', None)}", []))
 
-        candidates = list(getattr(result, "q_solve", []))
+        single_ret = None
+        single_q = None
+        if hasattr(self.algo, "rm_algo_inverse_kinematics"):
+            try:
+                single_ret, single_q = self.algo.rm_algo_inverse_kinematics(params)
+            except Exception as exc:
+                diagnostics["single_ik_error"] = str(exc)
+        diagnostics["single_ik_ret"] = single_ret
+        if single_ret == 0 and single_q is not None:
+            candidates.append(single_q)
+
         for idx, raw_q in enumerate(candidates):
             q = _first_six(raw_q)
             if len(q) < 6 or any(not math.isfinite(v) for v in q):
@@ -313,8 +333,8 @@ class Rm65SafeIkMover:
                 1.0 * sum(abs(d) for d in deltas[:3])
                 + 1.5 * sum(abs(d) for d in deltas[3:5])
                 + 3.0 * abs(deltas[5])
-                - 0.2 * abs(q[2])
-                - 0.2 * abs(q[4])
+                - 0.2 * max(0.0, abs(q[2]) - self.min_abs_j3_deg)
+                - 0.2 * max(0.0, abs(q[4]) - self.min_abs_j5_deg)
             )
             diagnostics["accepted"].append((score, idx, q_command, deltas))
 
