@@ -1,4 +1,0 @@
-index,ok,quality,score,center_x,center_y,center_z,normal_x,normal_y,normal_z,overlay
-1,1,ok,0.553031861782074,-0.18888400719335516,-0.599116716579687,0.03415365930956665,-0.4147105739835906,0.8999860601582012,0.13431392834371098,/home/wooshrobot/bai/hand_eye_calibration/wheel_hole_insertion/stability_verify_A_reprocessed/detections/sample_01_overlay.png
-2,1,ok,0.7876816391944885,-0.19392296802248343,-0.5988604787781142,0.037935037599168116,-0.41997089586076425,0.8968483128967938,0.13887962515819893,/home/wooshrobot/bai/hand_eye_calibration/wheel_hole_insertion/stability_verify_A_reprocessed/detections/sample_02_overlay.png
-3,0,,,,,,,,,

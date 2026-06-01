@@ -1,0 +1,80 @@
+# Central configuration for steering-wheel center-hole insertion.
+# Units: distances in meters, angles in radians unless a key says _deg.
+
+robot:
+  ip: "169.254.128.21"
+  port: 8080
+  force_type_name: "RM_MODEL_RM_SF_E"
+  initial_joint_deg: [-9.144, 72.947, 94.574, -99.437, -88.530, -154.118]
+
+camera:
+  serial: ""
+  width: 1280
+  height: 720
+  fps: 30
+  warmup: 30
+
+hand_eye:
+  # Camera was bumped. Keep false until a fresh hand-eye calibration is written.
+  valid: false
+  frame: "T_EE_CAM"
+  matrix:
+    - [0.83343679, -0.55261378, 0.00106433, 0.02416865]
+    - [0.55261480, 0.83343547, -0.00148271, -0.10373028]
+    - [-0.00006769, 0.00182391, 0.99999833, 0.04847300]
+    - [0.0, 0.0, 0.0, 1.0]
+
+tool:
+  tool_axis: "+z"
+  tcp_to_tip_m: 0.1613
+  tip_tcp_m: [0.001787, -0.001436, 0.161261]
+
+motion:
+  initial_movej_speed: 50
+  movej_speed: 20
+  movel_speed: 3
+  frontend_insert_speed: 10
+  max_joint_step_deg: 90.0
+  max_j6_step_deg: 90.0
+
+insertion:
+  observed_right_offset_m: 0.0025
+  observed_up_offset_m: 0.0030
+  preinsert_distance_m: 0.080
+  insert_depth_m: 0.002
+  frontend_insert_distance_m: 0.010
+  frontend_max_insert_distance_m: 0.010
+  max_preinsert_move_m: 0.35
+  max_insert_move_m: 0.12
+  max_insert_depth_m: 0.015
+  min_tcp_z_m: -0.05
+  reverse_insert_axis: false
+
+detection:
+  model: "label_dataset/best.onnx"
+  imgsz: 960
+  yolo_conf: 0.05
+  yolo_iou: 0.45
+  mask_threshold: 0.5
+  min_confidence: 0.35
+  min_abs_normal_z: 0.55
+  normal_draw_length_m: 0.08
+
+gripper:
+  device_id: 9
+  open_position: 255
+  close_position: 0
+  speed: 255
+  force: 255
+  timeout_s: 5
+
+paths:
+  snapshot_dir: "preview_snapshots"
+  frontend_run_dir: "frontend_runs"
+  live_run_dir: "live_runs"
+  captures_dir: "captures"
+  recording_dir: "vla_recordings"
+
+recording:
+  fps: 10.0
+  robot_timeout_s: 1.0

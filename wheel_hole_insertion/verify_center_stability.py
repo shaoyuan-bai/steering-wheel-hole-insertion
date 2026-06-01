@@ -22,12 +22,13 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from detect_center_hole_yolo_rgbd import DEFAULT_MODEL, run_detection  # noqa: E402
 from insert_center_hole import T_EE_CAM, get_current_state, normalize, pose_to_matrix  # noqa: E402
+from config_loader import CONFIG, cfg_get  # noqa: E402
 
 
 SCRIPT_VERSION = "2026-05-26-center-stability-v1"
 DEFAULT_PYTHON = "/home/wooshrobot/miniconda3/envs/cyy/bin/python"
-DEFAULT_ROBOT_IP = "169.254.128.21"
-DEFAULT_ROBOT_PORT = 8080
+DEFAULT_ROBOT_IP = cfg_get(CONFIG, "robot", "ip", default="169.254.128.21")
+DEFAULT_ROBOT_PORT = int(cfg_get(CONFIG, "robot", "port", default=8080))
 
 
 def make_detect_args(capture_dir, out_dir, out_stem, cli_args):

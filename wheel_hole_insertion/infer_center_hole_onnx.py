@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import cv2
@@ -10,7 +11,12 @@ import numpy as np
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL = SCRIPT_DIR / "label_dataset" / "best.onnx"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from config_loader import CONFIG, relative_path  # noqa: E402
+
+DEFAULT_MODEL = relative_path(CONFIG, "detection", "model", default="label_dataset/best.onnx")
 
 
 def sigmoid(x):

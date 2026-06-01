@@ -20,10 +20,11 @@ if str(SCRIPT_DIR) not in sys.path:
 
 from infer_center_hole_onnx import crop_mask_to_box, letterbox, nms, sigmoid  # noqa: E402
 from insert_center_hole import backproject_pixels, intersect_pixel_ray_with_plane, intr_value, robust_plane  # noqa: E402
+from config_loader import CONFIG, cfg_get, relative_path  # noqa: E402
 
 
 SCRIPT_VERSION = "2026-05-25-yolo-rgbd-center-hole-v1"
-DEFAULT_MODEL = SCRIPT_DIR / "label_dataset" / "best.onnx"
+DEFAULT_MODEL = relative_path(CONFIG, "detection", "model", default="label_dataset/best.onnx")
 
 
 def load_rgbd(input_path):
@@ -343,10 +344,10 @@ def parse_args():
     parser.add_argument("--model", default=str(DEFAULT_MODEL))
     parser.add_argument("--out-dir", default=str(SCRIPT_DIR))
     parser.add_argument("--out-stem", default="")
-    parser.add_argument("--imgsz", type=int, default=960)
-    parser.add_argument("--conf", type=float, default=0.35)
-    parser.add_argument("--iou", type=float, default=0.45)
-    parser.add_argument("--mask-threshold", type=float, default=0.5)
+    parser.add_argument("--imgsz", type=int, default=int(cfg_get(CONFIG, "detection", "imgsz", default=960)))
+    parser.add_argument("--conf", type=float, default=float(cfg_get(CONFIG, "detection", "min_confidence", default=0.35)))
+    parser.add_argument("--iou", type=float, default=float(cfg_get(CONFIG, "detection", "yolo_iou", default=0.45)))
+    parser.add_argument("--mask-threshold", type=float, default=float(cfg_get(CONFIG, "detection", "mask_threshold", default=0.5)))
     parser.add_argument("--min-depth", type=float, default=0.18)
     parser.add_argument("--max-depth", type=float, default=1.20)
     parser.add_argument("--plane-inner-radius-px", type=float, default=20)
@@ -359,14 +360,14 @@ def parse_args():
     parser.add_argument("--metal-max-saturation", type=int, default=145)
     parser.add_argument("--metal-min-gray", type=int, default=35)
     parser.add_argument("--metal-min-value", type=int, default=35)
-    parser.add_argument("--min-confidence", type=float, default=0.45)
+    parser.add_argument("--min-confidence", type=float, default=float(cfg_get(CONFIG, "detection", "min_confidence", default=0.45)))
     parser.add_argument("--min-mask-area-px", type=float, default=60)
     parser.add_argument("--max-mask-area-px", type=float, default=20000)
     parser.add_argument("--max-plane-rmse-m", type=float, default=0.004)
-    parser.add_argument("--min-abs-normal-z", type=float, default=0.55)
+    parser.add_argument("--min-abs-normal-z", type=float, default=float(cfg_get(CONFIG, "detection", "min_abs_normal_z", default=0.55)))
     parser.add_argument("--min-plane-inliers", type=int, default=1200)
     parser.add_argument("--min-plane-inlier-ratio", type=float, default=0.10)
-    parser.add_argument("--normal-draw-length-m", type=float, default=0.08)
+    parser.add_argument("--normal-draw-length-m", type=float, default=float(cfg_get(CONFIG, "detection", "normal_draw_length_m", default=0.08)))
     parser.add_argument("--overlay-alpha", type=float, default=0.38)
     return parser.parse_args()
 

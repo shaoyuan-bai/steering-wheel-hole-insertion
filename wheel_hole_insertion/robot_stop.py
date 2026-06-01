@@ -7,14 +7,18 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
 from rm65_sdk_safe_ik import Rm65SafeIkMover  # noqa: E402
+from config_loader import CONFIG, cfg_get  # noqa: E402
 
 
-DEFAULT_ROBOT_IP = "169.254.128.21"
-DEFAULT_ROBOT_PORT = 8080
+DEFAULT_ROBOT_IP = cfg_get(CONFIG, "robot", "ip", default="169.254.128.21")
+DEFAULT_ROBOT_PORT = int(cfg_get(CONFIG, "robot", "port", default=8080))
 
 
 def parse_args():

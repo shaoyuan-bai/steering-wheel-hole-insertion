@@ -12,6 +12,12 @@ import pyrealsense2 as rs
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+import sys
+
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from config_loader import CONFIG, cfg_get, relative_path  # noqa: E402
 
 
 def intrinsics_to_dict(intr):
@@ -48,12 +54,12 @@ def make_output_dir(root):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--serial", default="")
-    parser.add_argument("--out", default=str(SCRIPT_DIR / "captures"))
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--warmup", type=int, default=30)
+    parser.add_argument("--serial", default=cfg_get(CONFIG, "camera", "serial", default=""))
+    parser.add_argument("--out", default=str(relative_path(CONFIG, "paths", "captures_dir", default="captures")))
+    parser.add_argument("--width", type=int, default=int(cfg_get(CONFIG, "camera", "width", default=1280)))
+    parser.add_argument("--height", type=int, default=int(cfg_get(CONFIG, "camera", "height", default=720)))
+    parser.add_argument("--fps", type=int, default=int(cfg_get(CONFIG, "camera", "fps", default=30)))
+    parser.add_argument("--warmup", type=int, default=int(cfg_get(CONFIG, "camera", "warmup", default=30)))
     parser.add_argument("--alpha", type=float, default=0.55)
     args = parser.parse_args()
 

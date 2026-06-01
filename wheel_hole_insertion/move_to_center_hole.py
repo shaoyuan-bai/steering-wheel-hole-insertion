@@ -30,9 +30,12 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from insert_center_hole import (  # noqa: E402
+    CONFIG,
+    HAND_EYE_VALID,
     SDK_FORCE_TYPE_NAME,
     T_EE_CAM,
     build_rotation_aligning_tool_axis,
+    cfg_get,
     get_current_state,
     matrix_to_rpy_xyz,
     normalize,
@@ -43,8 +46,8 @@ from rm65_sdk_safe_ik import Rm65SafeIkMover  # noqa: E402
 
 
 SCRIPT_VERSION = "2026-05-21-move-to-center-hole-v1"
-DEFAULT_ROBOT_IP = "169.254.128.21"
-DEFAULT_ROBOT_PORT = 8080
+DEFAULT_ROBOT_IP = cfg_get(CONFIG, "robot", "ip", default="169.254.128.21")
+DEFAULT_ROBOT_PORT = int(cfg_get(CONFIG, "robot", "port", default=8080))
 
 
 def load_detection(path):
@@ -114,12 +117,17 @@ def build_plan_from_base(pose_now, center_base, normal_base, args, quality="base
 
     current_rot = pose_to_matrix(pose_now)[:3, :3]
     tool_axis_local = parse_tool_axis(args.tool_axis)
-    target_rot = build_rotation_aligning_tool_axis(current_rot, tool_axis_local, insert_axis_base)
-    target_rpy = matrix_to_rpy_xyz(target_rot)
+    if getattr(args, "keep_current_orientation", False):
+        target_rot = current_rot
+        target_rpy = np.asarray(pose_now[3:6], dtype=np.float64)
+    else:
+        target_rot = build_rotation_aligning_tool_axis(current_rot, tool_axis_local, insert_axis_base)
+        target_rpy = matrix_to_rpy_xyz(target_rot)
 
+    tip_tcp = get_tip_tcp_vector(args, tool_axis_local)
     pre_tip = center_base - insert_axis_base * float(args.preinsert_distance_m)
     final_tip = center_base + insert_axis_base * float(args.insert_depth_m)
-    tcp_offset_base = target_rot @ (tool_axis_local * float(args.tcp_to_tip_m))
+    tcp_offset_base = target_rot @ tip_tcp
     pre_tcp = pre_tip - tcp_offset_base
     final_tcp = final_tip - tcp_offset_base
 
@@ -157,9 +165,11 @@ def build_plan_from_base(pose_now, center_base, normal_base, args, quality="base
         "preinsert_move_m": float(np.linalg.norm(pre_tcp - current_xyz)),
         "insert_move_m": float(np.linalg.norm(final_tcp - pre_tcp)),
         "tcp_to_tip_m": float(args.tcp_to_tip_m),
+        "tip_tcp_m": tip_tcp.tolist(),
         "preinsert_distance_m": float(args.preinsert_distance_m),
         "insert_depth_m": float(args.insert_depth_m),
         "tool_axis": args.tool_axis,
+        "keep_current_orientation": bool(getattr(args, "keep_current_orientation", False)),
     }
 
 
@@ -185,6 +195,12 @@ def parse_vec3(text, name):
     return [float(p) for p in parts]
 
 
+def get_tip_tcp_vector(args, tool_axis_local):
+    if getattr(args, "tip_tcp_m", ""):
+        return np.asarray(parse_vec3(args.tip_tcp_m, "--tip-tcp-m"), dtype=np.float64)
+    return np.asarray(tool_axis_local, dtype=np.float64) * float(args.tcp_to_tip_m)
+
+
 def print_plan(detection_path, pose_now, joint_now, plan):
     print("\n" + "=" * 72)
     print(f"script: {SCRIPT_VERSION}")
@@ -202,6 +218,8 @@ def print_plan(detection_path, pose_now, joint_now, plan):
     print(f"preinsert move: {plan['preinsert_move_m'] * 1000.0:.1f} mm")
     print(f"insert move: {plan['insert_move_m'] * 1000.0:.1f} mm")
     print(f"tcp_to_tip: {plan['tcp_to_tip_m'] * 1000.0:.1f} mm")
+    if "tip_tcp_m" in plan:
+        print(f"tip_tcp_m: {[round(float(x), 6) for x in plan['tip_tcp_m']]}")
     print("=" * 72)
 
 
@@ -281,11 +299,107 @@ def solve_and_movej(sdk_mover, current_joint, target_pose, speed):
         sdk_mover.speed = old_speed
 
 
+def rotation_about_axis(axis, angle_rad):
+    axis = normalize(np.asarray(axis, dtype=np.float64), "roll axis")
+    x, y, z = axis
+    c = float(np.cos(angle_rad))
+    s = float(np.sin(angle_rad))
+    cc = 1.0 - c
+    return np.array([
+        [c + x * x * cc, x * y * cc - z * s, x * z * cc + y * s],
+        [y * x * cc + z * s, c + y * y * cc, y * z * cc - x * s],
+        [z * x * cc - y * s, z * y * cc + x * s, c + z * z * cc],
+    ], dtype=np.float64)
+
+
+def parse_roll_search_degs(text):
+    if not str(text).strip():
+        return []
+    values = []
+    for item in str(text).replace(";", ",").split(","):
+        item = item.strip()
+        if item:
+            values.append(float(item))
+    return values
+
+
+def make_roll_search_poses(target_pose, tool_axis_local, roll_degs):
+    if not roll_degs:
+        return [target_pose]
+    base_rot = pose_to_matrix(target_pose)[:3, :3]
+    local_roll_axis = parse_tool_axis(tool_axis_local)
+    poses = []
+    seen = set()
+    for deg in roll_degs:
+        key = round(float(deg), 6)
+        if key in seen:
+            continue
+        seen.add(key)
+        rot = base_rot @ rotation_about_axis(local_roll_axis, np.deg2rad(float(deg)))
+        rpy = matrix_to_rpy_xyz(rot)
+        poses.append([
+            float(target_pose[0]),
+            float(target_pose[1]),
+            float(target_pose[2]),
+            float(rpy[0]),
+            float(rpy[1]),
+            float(rpy[2]),
+        ])
+    return poses
+
+
+def solve_roll_search_and_movej(sdk_mover, current_joint, target_pose, args):
+    roll_degs = parse_roll_search_degs(args.roll_search_deg)
+    target_poses = make_roll_search_poses(target_pose, args.tool_axis, roll_degs)
+    print(f"[IK] roll-search candidates deg: {roll_degs if roll_degs else [0.0]}")
+    old_speed = sdk_mover.speed
+    sdk_mover.speed = int(args.movej_speed)
+    try:
+        best_joint, best_pose, diagnostics = sdk_mover.solve_best_joint_for_poses(
+            current_joint, target_poses
+        )
+        if best_joint is None:
+            print(f"[IK] no safe roll-search solution. accepted={len(diagnostics.get('accepted', []))}, "
+                  f"rejected={len(diagnostics.get('rejected', []))}")
+            for item in diagnostics.get("rejected", [])[:12]:
+                print(f"[IK] reject sample: {item}")
+            return False
+        chosen_pose_index = diagnostics.get("accepted", [(None, 0)])[0][1]
+        chosen_roll = roll_degs[chosen_pose_index] if chosen_pose_index is not None and roll_degs else 0.0
+        print(f"[IK] selected roll deg: {chosen_roll:.1f}")
+        print(f"[IK] selected pose: {[round(float(x), 5) for x in best_pose]}")
+        print(f"[MOVEJ] target joint: {[round(float(x), 3) for x in best_joint]}")
+        ret = sdk_mover.movej(best_joint)
+        print(f"[MOVEJ] ret={ret}")
+        return ret == 0
+    finally:
+        sdk_mover.speed = old_speed
+
+
 def run_movel(sdk_mover, target_pose, speed):
     sdk_mover.connect()
     ret = sdk_mover.arm.rm_movel(target_pose, int(speed), 0, 0, 1)
     print(f"[MOVEL] ret={ret}")
     return ret == 0
+
+
+def run_movej_p(sdk_mover, target_pose, speed):
+    sdk_mover.connect()
+    print(f"[MOVEJ_P] target pose: {[round(float(x), 5) for x in target_pose]}")
+    ret = sdk_mover.arm.rm_movej_p(target_pose, int(speed), 0, 0, 1)
+    print(f"[MOVEJ_P] ret={ret}")
+    return ret == 0
+
+
+def build_orientation_align_pose(pose_now, plan):
+    return [
+        float(pose_now[0]),
+        float(pose_now[1]),
+        float(pose_now[2]),
+        float(plan["preinsert_pose"][3]),
+        float(plan["preinsert_pose"][4]),
+        float(plan["preinsert_pose"][5]),
+    ]
 
 
 def build_insert_target_from_current(pose_now, plan, args):
@@ -384,31 +498,59 @@ def parse_args():
                         help="Fixed base-frame center x,y,z in meters. Bypasses camera detection transform.")
     parser.add_argument("--base-normal", default="",
                         help="Fixed base-frame normal x,y,z. Usually the plane normal pointing toward camera.")
-    parser.add_argument("--observed-right-offset-m", type=float, default=0.0,
+    parser.add_argument("--observed-right-offset-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "observed_right_offset_m", default=0.0)),
                         help="Observed rod offset to the right of the hole, from robot-to-hole view. Target is compensated left.")
-    parser.add_argument("--observed-up-offset-m", type=float, default=0.0,
+    parser.add_argument("--observed-up-offset-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "observed_up_offset_m", default=0.0)),
                         help="Observed rod offset above the hole, from robot-to-hole view. Target is compensated down.")
     parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
     parser.add_argument("--robot-port", type=int, default=DEFAULT_ROBOT_PORT)
-    parser.add_argument("--tool-axis", default="+z", choices=["+x", "-x", "+y", "-y", "+z", "-z"])
+    parser.add_argument("--tool-axis", default=cfg_get(CONFIG, "tool", "tool_axis", default="+z"),
+                        choices=["+x", "-x", "+y", "-y", "+z", "-z"])
     parser.add_argument("--reverse-insert-axis", action="store_true",
                         help="Flip the default insertion axis.")
-    parser.add_argument("--tcp-to-tip-m", type=float, default=0.150)
-    parser.add_argument("--preinsert-distance-m", type=float, default=0.080)
-    parser.add_argument("--insert-depth-m", type=float, default=0.005)
-    parser.add_argument("--max-preinsert-move-m", type=float, default=0.50)
-    parser.add_argument("--max-insert-move-m", type=float, default=0.12)
-    parser.add_argument("--max-insert-depth-m", type=float, default=0.015)
-    parser.add_argument("--min-tcp-z-m", type=float, default=-0.05,
+    parser.add_argument("--tcp-to-tip-m", type=float,
+                        default=float(cfg_get(CONFIG, "tool", "tcp_to_tip_m", default=0.150)))
+    parser.add_argument("--tip-tcp-m", default=",".join(str(x) for x in cfg_get(CONFIG, "tool", "tip_tcp_m", default=[])),
+                        help="Full rod tip vector in TCP frame, x,y,z meters. Overrides --tcp-to-tip-m.")
+    parser.add_argument("--preinsert-distance-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "preinsert_distance_m", default=0.080)))
+    parser.add_argument("--insert-depth-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "insert_depth_m", default=0.005)))
+    parser.add_argument("--max-preinsert-move-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "max_preinsert_move_m", default=0.50)))
+    parser.add_argument("--max-insert-move-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "max_insert_move_m", default=0.12)))
+    parser.add_argument("--max-insert-depth-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "max_insert_depth_m", default=0.015)))
+    parser.add_argument("--min-tcp-z-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "min_tcp_z_m", default=-0.05)),
                         help="Refuse motion if planned TCP z is below this base-frame height.")
     parser.add_argument("--insert-step-m", type=float, default=0.0,
                         help="For --insert, move only this distance from current pose toward final_pose. 0 means full insert.")
-    parser.add_argument("--movej-speed", type=int, default=8)
-    parser.add_argument("--movel-speed", type=int, default=3)
-    parser.add_argument("--max-joint-step-deg", type=float, default=90.0)
-    parser.add_argument("--max-j6-step-deg", type=float, default=60.0)
+    parser.add_argument("--movej-speed", type=int,
+                        default=int(cfg_get(CONFIG, "motion", "movej_speed", default=8)))
+    parser.add_argument("--movel-speed", type=int,
+                        default=int(cfg_get(CONFIG, "motion", "movel_speed", default=3)))
+    parser.add_argument("--max-joint-step-deg", type=float,
+                        default=float(cfg_get(CONFIG, "motion", "max_joint_step_deg", default=90.0)))
+    parser.add_argument("--max-j6-step-deg", type=float,
+                        default=float(cfg_get(CONFIG, "motion", "max_j6_step_deg", default=60.0)))
+    parser.add_argument("--roll-search-deg", default="",
+                        help="Comma-separated wrist roll candidates around the tool insertion axis, in degrees.")
+    parser.add_argument("--controller-pose-fallback", action="store_true",
+                        help="If local SDK IK fails for preinsert, use controller rm_movej_p to plan to the checked pose.")
+    parser.add_argument("--keep-current-orientation", action="store_true",
+                        help="Keep the current TCP orientation while planning the target tip position.")
+    parser.add_argument("--align-orientation-first", action="store_true",
+                        help="Before moving to preinsert, rotate the current TCP pose to the planned insertion orientation.")
+    parser.add_argument("--align-orientation-only", action="store_true",
+                        help="Only rotate the current TCP pose to the planned insertion orientation, then stop.")
     parser.add_argument("--require-quality-ok", action="store_true", default=True)
     parser.add_argument("--allow-non-ok-quality", action="store_true")
+    parser.add_argument("--allow-stale-hand-eye", action="store_true",
+                        help="Allow motion even if config hand_eye.valid is false.")
     parser.add_argument("--move-preinsert", action="store_true",
                         help="Actually movej to pre-insertion pose.")
     parser.add_argument("--insert", action="store_true",
@@ -424,6 +566,13 @@ def main():
     args = parse_args()
     if args.allow_non_ok_quality:
         args.require_quality_ok = False
+    wants_motion = args.move_preinsert or args.insert or args.align_orientation_only
+    if wants_motion and not HAND_EYE_VALID and not args.allow_stale_hand_eye:
+        raise RuntimeError(
+            "Hand-eye calibration is marked invalid in wheel_hole_insertion/config.yaml. "
+            "Update hand_eye.matrix and set hand_eye.valid=true after recalibration, "
+            "or pass --allow-stale-hand-eye for controlled debugging."
+        )
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -459,7 +608,7 @@ def main():
 
         check_plan(plan, args, allow_insert=args.insert, allow_preinsert=(args.move_preinsert or not args.insert))
 
-        if not args.move_preinsert and not args.insert:
+        if not args.move_preinsert and not args.insert and not args.align_orientation_only:
             print("[DRY-RUN] No motion sent. Use --move-preinsert first.")
             return
 
@@ -472,13 +621,74 @@ def main():
             max_j6_step_deg=args.max_j6_step_deg,
         )
         try:
-            if args.move_preinsert:
-                print("[EXEC] movej to pre-insertion pose")
+            if args.align_orientation_only:
+                align_pose = build_orientation_align_pose(pose_now, plan)
+                print("[EXEC] align TCP orientation only")
+                print(f"[ALIGN] target pose: {[round(float(x), 5) for x in align_pose]}")
                 ok = run_motion_with_keyboard_stop(
-                    "preinsert",
-                    lambda: solve_and_movej(sdk_mover, joint_now, plan["preinsert_pose"], args.movej_speed),
+                    "align-orientation-only",
+                    lambda: solve_and_movej(sdk_mover, joint_now, align_pose, args.movej_speed),
                     args,
                 )
+                if not ok and args.controller_pose_fallback:
+                    print("[EXEC] local IK failed; trying controller rm_movej_p orientation fallback")
+                    ok = run_motion_with_keyboard_stop(
+                        "align-orientation-only-controller-fallback",
+                        lambda: run_movej_p(sdk_mover, align_pose, args.movej_speed),
+                        args,
+                    )
+                if not ok:
+                    raise RuntimeError("Orientation alignment failed.")
+                return
+
+            if args.move_preinsert:
+                if args.align_orientation_first:
+                    align_pose = build_orientation_align_pose(pose_now, plan)
+                    print("[EXEC] align TCP orientation to insertion normal")
+                    print(f"[ALIGN] target pose: {[round(float(x), 5) for x in align_pose]}")
+                    ok = run_motion_with_keyboard_stop(
+                        "align-orientation",
+                        lambda: solve_and_movej(sdk_mover, joint_now, align_pose, args.movej_speed),
+                        args,
+                    )
+                    if not ok and args.controller_pose_fallback:
+                        print("[EXEC] local IK failed; trying controller rm_movej_p orientation fallback")
+                        ok = run_motion_with_keyboard_stop(
+                            "align-orientation-controller-fallback",
+                            lambda: run_movej_p(sdk_mover, align_pose, args.movej_speed),
+                            args,
+                        )
+                    if not ok:
+                        raise RuntimeError("Orientation alignment failed.")
+                    time.sleep(0.2)
+                    state = get_current_state(sock)
+                    if not state:
+                        raise RuntimeError("Failed to read current robot state after orientation alignment.")
+                    pose_now, joint_now = state
+                    print(f"[ALIGN] current pose after align: {[round(float(x), 5) for x in pose_now]}")
+                    print(f"[ALIGN] current joint after align: {[round(float(x), 3) for x in joint_now]}")
+
+                print("[EXEC] movej to pre-insertion pose")
+                if args.roll_search_deg:
+                    motion_fn = lambda: solve_roll_search_and_movej(
+                        sdk_mover, joint_now, plan["preinsert_pose"], args
+                    )
+                else:
+                    motion_fn = lambda: solve_and_movej(
+                        sdk_mover, joint_now, plan["preinsert_pose"], args.movej_speed
+                    )
+                ok = run_motion_with_keyboard_stop(
+                    "preinsert",
+                    motion_fn,
+                    args,
+                )
+                if not ok and args.controller_pose_fallback:
+                    print("[EXEC] local IK failed; trying controller rm_movej_p fallback")
+                    ok = run_motion_with_keyboard_stop(
+                        "preinsert-controller-fallback",
+                        lambda: run_movej_p(sdk_mover, plan["preinsert_pose"], args.movej_speed),
+                        args,
+                    )
                 if not ok:
                     raise RuntimeError("Pre-insertion move failed.")
                 time.sleep(0.2)

@@ -34,23 +34,20 @@ if str(ROOT) not in sys.path:
 
 from rm65_sdk_safe_ik import Rm65SafeIkMover  # noqa: E402
 import head_rgbd_detect_wheel as wheel_rgbd  # noqa: E402
+from config_loader import CONFIG, cfg_get  # noqa: E402
 
 
 SCRIPT_VERSION = "2026-05-20-eye-in-hand-wheel-hole-insertion-v1"
 
-ROBOT_IP = "169.254.128.21"
-ROBOT_PORT = 8080
-SDK_FORCE_TYPE_NAME = "RM_MODEL_RM_SF_E"
+ROBOT_IP = cfg_get(CONFIG, "robot", "ip", default="169.254.128.21")
+ROBOT_PORT = int(cfg_get(CONFIG, "robot", "port", default=8080))
+SDK_FORCE_TYPE_NAME = cfg_get(CONFIG, "robot", "force_type_name", default="RM_MODEL_RM_SF_E")
 
-MOVEJ_SPEED = 8
-MOVEL_SPEED = 5
+MOVEJ_SPEED = int(cfg_get(CONFIG, "motion", "movej_speed", default=8))
+MOVEL_SPEED = int(cfg_get(CONFIG, "motion", "movel_speed", default=5))
+HAND_EYE_VALID = bool(cfg_get(CONFIG, "hand_eye", "valid", default=False))
 
-T_EE_CAM = np.array([
-    [0.83343679, -0.55261378, 0.00106433, 0.02416865],
-    [0.55261480, 0.83343547, -0.00148271, -0.10373028],
-    [-0.00006769, 0.00182391, 0.99999833, 0.04847300],
-    [0.0, 0.0, 0.0, 1.0],
-], dtype=np.float64)
+T_EE_CAM = np.array(cfg_get(CONFIG, "hand_eye", "matrix"), dtype=np.float64)
 
 clicked_pixel = None
 auto_hole = None
@@ -766,20 +763,27 @@ def parse_args():
                         help="Disable automatic hole selection and use left-click as fallback.")
     parser.add_argument("--robot-ip", default=ROBOT_IP)
     parser.add_argument("--robot-port", type=int, default=ROBOT_PORT)
-    parser.add_argument("--serial", default="", help="Optional RealSense serial number.")
-    parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--height", type=int, default=480)
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--tool-axis", default="+z", choices=["+x", "-x", "+y", "-y", "+z", "-z"],
+    parser.add_argument("--serial", default=cfg_get(CONFIG, "camera", "serial", default=""),
+                        help="Optional RealSense serial number.")
+    parser.add_argument("--width", type=int, default=int(cfg_get(CONFIG, "camera", "width", default=640)))
+    parser.add_argument("--height", type=int, default=int(cfg_get(CONFIG, "camera", "height", default=480)))
+    parser.add_argument("--fps", type=int, default=int(cfg_get(CONFIG, "camera", "fps", default=30)))
+    parser.add_argument("--tool-axis", default=cfg_get(CONFIG, "tool", "tool_axis", default="+z"),
+                        choices=["+x", "-x", "+y", "-y", "+z", "-z"],
                         help="TCP-frame axis that points along the physical insertion direction.")
     parser.add_argument("--reverse-insert-axis", action="store_true",
                         help="Use the opposite side of the fitted plane normal.")
-    parser.add_argument("--tcp-to-tip-m", type=float, default=0.150,
+    parser.add_argument("--tcp-to-tip-m", type=float,
+                        default=float(cfg_get(CONFIG, "tool", "tcp_to_tip_m", default=0.150)),
                         help="Distance from TCP to insertion tip along --tool-axis.")
-    parser.add_argument("--preinsert-distance-m", type=float, default=0.080)
-    parser.add_argument("--insert-depth-m", type=float, default=0.020)
-    parser.add_argument("--max-preinsert-move-m", type=float, default=0.45)
-    parser.add_argument("--max-insert-move-m", type=float, default=0.12)
+    parser.add_argument("--preinsert-distance-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "preinsert_distance_m", default=0.080)))
+    parser.add_argument("--insert-depth-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "insert_depth_m", default=0.020)))
+    parser.add_argument("--max-preinsert-move-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "max_preinsert_move_m", default=0.45)))
+    parser.add_argument("--max-insert-move-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "max_insert_move_m", default=0.12)))
     parser.add_argument("--plane-inner-radius-px", type=float, default=28)
     parser.add_argument("--plane-outer-radius-px", type=float, default=95)
     parser.add_argument("--min-plane-points", type=int, default=500)
@@ -822,6 +826,8 @@ def parse_args():
     parser.add_argument("--outer-roi-y1", type=float, default=0.98)
     parser.add_argument("--movej-speed", type=int, default=MOVEJ_SPEED)
     parser.add_argument("--movel-speed", type=int, default=MOVEL_SPEED)
+    parser.add_argument("--allow-stale-hand-eye", action="store_true",
+                        help="Allow motion even if config hand_eye.valid is false.")
     return parser.parse_args()
 
 
@@ -844,6 +850,12 @@ def main():
         print("[INFO] --manual-click enabled: p will use the clicked point instead of auto detection.")
     if not args.execute:
         print("[DRY-RUN] Robot motion is disabled. Add --execute to allow m/i/b movement keys.")
+    elif not HAND_EYE_VALID and not args.allow_stale_hand_eye:
+        print(
+            "[FAIL] Hand-eye calibration is marked invalid in wheel_hole_insertion/config.yaml. "
+            "Update hand_eye.matrix and set hand_eye.valid=true after recalibration."
+        )
+        return
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:

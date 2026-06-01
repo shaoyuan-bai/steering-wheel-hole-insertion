@@ -8,12 +8,34 @@
 - 已实现 YOLO mask + RGBD 金属环局部平面拟合，输出中心孔位置、法向和质量评估。
 - 已实现基于手眼外参的 base 坐标规划，支持保存/加载固定计划，避免移动后用旧相机检测重新换算。
 - 已加入按键急停和独立停止脚本：运动时按 `s`、空格、回车或 `q` 会发送 `rm_set_arm_stop()`。
-- 已加入 `observed-right-offset-m` / `observed-up-offset-m` 视觉偏差补偿，当前保留两版计划：
-  - `stability_verify_A_reprocessed/base_mean_preinsert_plan_corrected.json`：右 2.5 mm，上 3.0 mm。
-  - `stability_verify_A_reprocessed/base_mean_preinsert_plan_corrected_r45_u30.json`：右 4.5 mm，上 3.0 mm。
-- 已实现内网 RealSense 前端 `realsense_preview_server.py`，支持彩色预览、截图和“回初始位置”按钮。
+- 已加入 `observed-right-offset-m` / `observed-up-offset-m` 视觉偏差补偿，默认值集中在 `config.yaml`。
+- 已实现内网 RealSense 前端 `realsense_preview_server.py`，支持彩色预览、YOLO 叠加、夹爪控制、运动按钮和 VLA 数据保存。
 - 已实现现场一键流程 `run_live_yolo_preinsert.py`：每次重新拍照、YOLO 识别、移动到预插入、移动到 YOLO 终点、再沿插入轴额外前伸。
-- 现场验证 A 的有效样本显示中心点约 3 mm 级稳定，法向约 0.22 度稳定；后续重点是 TCP/插入杆偏置补偿和避开奇异位姿。
+- 已实现杆尖 pivot 标定 `calibrate_insert_tip_pivot.py`，当前杆尖配置为 `tip_tcp_m: [0.001787, -0.001436, 0.161261]`。
+
+## 配置
+
+设备相关参数集中在：
+
+```bash
+wheel_hole_insertion/config.yaml
+```
+
+这里包含：
+
+- 机器人 IP、端口、初始关节位姿。
+- 手眼矩阵 `hand_eye.matrix`。
+- 杆尖 TCP 偏置 `tool.tip_tcp_m`。
+- 视觉补偿、预插入距离、插入距离、安全阈值。
+- 相机分辨率、YOLO 权重路径、置信度阈值。
+- 前端速度、夹爪参数和 VLA 数据保存路径。
+
+注意：摄像头被撞后，当前 `hand_eye.valid` 已设置为 `false`。在重新手眼标定并更新 `hand_eye.matrix` 前，运动脚本会拒绝真实运动。重新标定后，把新矩阵写入 `config.yaml` 并设置：
+
+```yaml
+hand_eye:
+  valid: true
+```
 
 ## 思路
 
@@ -31,16 +53,38 @@
 当前推荐现场启动方式：
 
 ```bash
+/home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/realsense_preview_server.py
+```
+
+浏览器访问：
+
+```text
+http://<本机IP>:8090
+```
+
+前端支持：
+
+- 实时相机画面和 YOLO 叠加显示。
+- 回初始位。
+- 法向对齐姿态。
+- 按上次计划移动到预插入位置。
+- 沿当前工具轴插入 10 mm。
+- 夹爪开合。
+- 保存 RGB 视频和机械臂状态数据，用于后续 VLA 数据集。
+
+命令行一键流程仍可使用：
+
+```bash
 /home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/run_live_yolo_preinsert.py
 ```
 
 默认每一步都会询问是否继续：
 
-1. 实时拍照 + YOLO 识别。
-2. 默认先自动回到保存的初始关节位姿，不需要确认。
+1. 自动回到保存的初始关节位姿。
+2. 实时拍照 + YOLO 识别。
 3. 移动到预插入位置。
 4. 移动到 YOLO 计划终点。
-5. 无视 YOLO 终点，沿插入轴继续前伸 30 mm。
+5. 沿插入轴继续前伸。
 
 如果需要自动执行完整流程：
 
@@ -64,6 +108,14 @@
 
 ```bash
 --right-offset-m 0.0025 --up-offset-m 0.0030
+```
+
+这两个默认值也在 `config.yaml` 中：
+
+```yaml
+insertion:
+  observed_right_offset_m: 0.0025
+  observed_up_offset_m: 0.0030
 ```
 
 额外前伸默认 30 mm，可调整：
@@ -110,7 +162,7 @@
 无显示器采集一帧 RGBD：
 
 ```bash
-/home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/capture_rgbd_once_headless.py --serial 405622075930
+/home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/capture_rgbd_once_headless.py
 ```
 
 默认采集分辨率是 `1280x720@30fps`。D435I 的 RGB 最高可到 `1920x1080@30fps`，深度最高是 `1280x720@30fps`；为了 RGBD 对齐和法向计算，默认使用 `1280x720`。
@@ -118,13 +170,13 @@
 可以先离线只跑视觉识别，不连接机械臂：
 
 ```bash
-/home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/detect_center_hole_pose.py head_wheel_hybrid/wheel_hybrid_20260509_094055
+/home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/detect_center_hole_yolo_rgbd.py <RGBD采集目录>
 ```
 
 输出：
 
-- `center_hole_detection.json`
-- `center_hole_overlay.png`
+- `*_detection.json`
+- `*_overlay.png`
 
 默认输出的是“中间金属环内圆位置 + 金属环 RGBD 法向”。具体做法：
 

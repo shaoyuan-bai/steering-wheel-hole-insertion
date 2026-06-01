@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Continue insertion from current pose along a saved plan's insertion axis."""
+"""Continue insertion from current pose along a saved plan or tool axis."""
 
 import argparse
 import json
@@ -17,21 +17,27 @@ if str(ROOT) not in sys.path:
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from insert_center_hole import get_current_state, normalize  # noqa: E402
+from insert_center_hole import get_current_state, normalize, parse_tool_axis, pose_to_matrix  # noqa: E402
+from config_loader import CONFIG, cfg_get  # noqa: E402
 from move_to_center_hole import run_motion_with_keyboard_stop, run_movel  # noqa: E402
 from rm65_sdk_safe_ik import Rm65SafeIkMover  # noqa: E402
 
 
-DEFAULT_ROBOT_IP = "169.254.128.21"
-DEFAULT_ROBOT_PORT = 8080
+DEFAULT_ROBOT_IP = cfg_get(CONFIG, "robot", "ip", default="169.254.128.21")
+DEFAULT_ROBOT_PORT = int(cfg_get(CONFIG, "robot", "port", default=8080))
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--plan", required=True)
-    parser.add_argument("--distance-m", type=float, default=0.03)
-    parser.add_argument("--max-distance-m", type=float, default=0.03)
-    parser.add_argument("--speed", type=int, default=1)
+    parser.add_argument("--distance-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "frontend_insert_distance_m", default=0.03)))
+    parser.add_argument("--max-distance-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "frontend_max_insert_distance_m", default=0.03)))
+    parser.add_argument("--axis-source", choices=["plan", "current-tool"], default="plan")
+    parser.add_argument("--tool-axis", choices=["+x", "-x", "+y", "-y", "+z", "-z"],
+                        default=cfg_get(CONFIG, "tool", "tool_axis", default="+z"))
+    parser.add_argument("--speed", type=int, default=int(cfg_get(CONFIG, "motion", "frontend_insert_speed", default=1)))
     parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
     parser.add_argument("--robot-port", type=int, default=DEFAULT_ROBOT_PORT)
     parser.add_argument("--watch-stop-key", action="store_true")
@@ -52,7 +58,6 @@ def main():
 
     with open(Path(args.plan).expanduser().resolve(), "r", encoding="utf-8") as f:
         plan = json.load(f)
-    axis = normalize(np.asarray(plan["insert_axis_base"], dtype=np.float64), "insert_axis_base")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -63,6 +68,14 @@ def main():
         pose_now, joint_now = state
     finally:
         sock.close()
+
+    if args.axis_source == "current-tool":
+        rot = pose_to_matrix(pose_now)[:3, :3]
+        axis = normalize(rot @ parse_tool_axis(args.tool_axis), "current_tool_axis_base")
+        axis_label = f"current-tool {args.tool_axis}"
+    else:
+        axis = normalize(np.asarray(plan["insert_axis_base"], dtype=np.float64), "insert_axis_base")
+        axis_label = "plan insert_axis_base"
 
     current_xyz = np.asarray(pose_now[:3], dtype=np.float64)
     target_xyz = current_xyz + axis * distance
@@ -78,6 +91,7 @@ def main():
     print("=" * 72)
     print(f"current pose: {[round(float(x), 5) for x in pose_now]}")
     print(f"current joint: {[round(float(x), 3) for x in joint_now]}")
+    print(f"axis source: {axis_label}")
     print(f"insert_axis_base: {[round(float(x), 5) for x in axis]}")
     print(f"continue distance: {distance * 1000.0:.1f} mm")
     print(f"target pose: {[round(float(x), 5) for x in target_pose]}")

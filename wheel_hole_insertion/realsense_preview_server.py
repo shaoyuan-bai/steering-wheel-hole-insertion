@@ -2,6 +2,10 @@
 """LAN-accessible RealSense preview server for SSH-only operation."""
 
 import argparse
+import json
+import socket
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -9,13 +13,65 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pyrealsense2 as rs
-from flask import Flask, Response, jsonify, render_template_string
+from flask import Flask, Response, jsonify, render_template_string, request
 
-from rm65_sdk_safe_ik import Rm65SafeIkMover
+if str(SCRIPT_DIR := Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+ROOT = SCRIPT_DIR.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from insert_center_hole import get_current_state  # noqa: E402
+from config_loader import CONFIG, cfg_get, relative_path  # noqa: E402
+from infer_center_hole_onnx import crop_mask_to_box, letterbox, nms, sigmoid  # noqa: E402
+from rm65_sdk_safe_ik import Rm65SafeIkMover  # noqa: E402
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-INITIAL_JOINT_DEG = [-9.144, 72.947, 94.574, -99.437, -88.530, -154.118]
+INITIAL_JOINT_DEG = [float(x) for x in cfg_get(CONFIG, "robot", "initial_joint_deg", default=[])]
+DEFAULT_MODEL = relative_path(CONFIG, "detection", "model", default="label_dataset/best.onnx")
+
+
+def set_right_gripper_modbus(robot_ip, robot_port, position, force, speed, device_id, timeout_s):
+    commands = [
+        '{"command":"set_tool_voltage","voltage_type":3}\r\n',
+        '{"command":"set_modbus_mode","port":1,"baudrate":115200,"timeout ":2}\r\n',
+        '{"command":"write_registers","port":1,"address":1000,"num":1,"data":[0,0], "device":%d}\r\n' % device_id,
+        '{"command":"write_registers","port":1,"address":1000,"num":1,"data":[0,1], "device":%d}\r\n' % device_id,
+        '{"command":"write_registers","port":1,"address":1002,"num":1,"data":[%d,%d], "device":%d}\r\n' % (force, speed, device_id),
+        '{"command":"write_registers","port":1,"address":1001,"num":1,"data":[%d,%d], "device":%d}\r\n' % (position, position, device_id),
+        '{"command":"write_registers","port":1,"address":1000,"num":1,"data":[0,9], "device":%d}\r\n' % device_id,
+    ]
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as gripper_sock:
+        gripper_sock.settimeout(max(1, int(timeout_s)))
+        gripper_sock.connect((robot_ip, int(robot_port)))
+        time.sleep(0.2)
+        for command in commands:
+            gripper_sock.sendall(command.encode("utf-8"))
+            time.sleep(0.25)
+        time.sleep(0.8)
+
+
+def intrinsics_to_dict(intr):
+    return {
+        "width": int(intr.width),
+        "height": int(intr.height),
+        "ppx": float(intr.ppx),
+        "ppy": float(intr.ppy),
+        "fx": float(intr.fx),
+        "fy": float(intr.fy),
+        "model": str(intr.model),
+        "coeffs": [float(x) for x in intr.coeffs],
+    }
+
+
+def find_latest_frontend_plan(frontend_run_dir):
+    root = Path(frontend_run_dir).expanduser().resolve()
+    candidates = sorted(
+        root.glob("frontend_*/result/*_plan.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
 
 
 PAGE = """<!doctype html>
@@ -23,62 +79,262 @@ PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>RealSense Preview</title>
+  <title>RM65 方向盘插孔控制台</title>
   <style>
-    :root { color-scheme: dark; font-family: Arial, sans-serif; }
-    body { margin: 0; background: #111; color: #eee; }
-    header { height: 48px; display: flex; align-items: center; gap: 18px; padding: 0 16px; background: #1f1f1f; border-bottom: 1px solid #333; }
-    main { display: grid; grid-template-columns: 1fr 300px; gap: 14px; padding: 14px; }
-    img { width: 100%; max-height: calc(100vh - 86px); object-fit: contain; background: #000; border: 1px solid #333; }
-    aside { border: 1px solid #333; padding: 12px; background: #181818; }
-    .row { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0; border-bottom: 1px solid #2b2b2b; }
-    .k { color: #aaa; }
-    button { background: #2d6cdf; color: white; border: 0; padding: 9px 12px; cursor: pointer; }
-    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    :root {
+      color-scheme: dark;
+      font-family: Inter, "Microsoft YaHei", "Noto Sans CJK SC", Arial, sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #0d1117; color: #e6edf3; }
+    header {
+      min-height: 64px; display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; padding: 12px 18px; background: #151b23; border-bottom: 1px solid #30363d;
+    }
+    .brand { display: flex; flex-direction: column; gap: 4px; min-width: 260px; }
+    .brand strong { font-size: 18px; font-weight: 700; letter-spacing: 0; }
+    .brand span { color: #8b949e; font-size: 12px; }
+    .top-status { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; justify-content: flex-end; }
+    .pill { border: 1px solid #30363d; background: #0d1117; border-radius: 999px; padding: 6px 10px; color: #c9d1d9; font-size: 12px; }
+    .pill.ok { color: #7ee787; border-color: #238636; }
+    .pill.warn { color: #f2cc60; border-color: #9e6a03; }
+    main { display: grid; grid-template-columns: minmax(520px, 1fr) 360px; gap: 16px; padding: 16px; }
+    .panel { background: #151b23; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+    .panel-head { min-height: 44px; padding: 12px 14px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #30363d; }
+    .panel-title { font-weight: 700; font-size: 14px; }
+    .camera-wrap { position: relative; background: #05070a; }
+    img { display: block; width: 100%; height: calc(100vh - 174px); min-height: 520px; object-fit: contain; background: #05070a; }
+    .toolbar { display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 10px; padding: 12px; border-top: 1px solid #30363d; background: #111820; }
+    aside { display: flex; flex-direction: column; gap: 14px; }
+    section { background: #151b23; border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+    section h2 { margin: 0; padding: 11px 12px; border-bottom: 1px solid #30363d; font-size: 14px; }
+    .rows { padding: 8px 12px; }
+    .row { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid #262c36; font-size: 13px; }
+    .row:last-child { border-bottom: 0; }
+    .k { color: #8b949e; white-space: nowrap; }
+    .v { color: #e6edf3; text-align: right; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
+    button {
+      min-height: 38px; border: 1px solid #3b4654; border-radius: 8px; background: #1f6feb;
+      color: #fff; padding: 8px 12px; cursor: pointer; font-weight: 650; font-size: 13px;
+    }
+    button.secondary { background: #21262d; color: #c9d1d9; }
+    button.success { background: #238636; border-color: #2ea043; }
+    button.warn { background: #9e6a03; border-color: #bb8009; }
+    button.danger { background: #da3633; border-color: #f85149; }
+    button.record { background: #a371f7; border-color: #bc8cff; }
+    .stack { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 12px; }
+    .speed-grid { display: grid; grid-template-columns: 1fr; gap: 10px; padding: 12px; }
+    .speed-field { display: grid; grid-template-columns: 1fr 92px; gap: 10px; align-items: center; }
+    .speed-field label { color: #8b949e; font-size: 13px; }
+    .speed-field input {
+      width: 100%; min-height: 34px; border: 1px solid #3b4654; border-radius: 8px;
+      background: #0d1117; color: #e6edf3; padding: 6px 8px; font-size: 13px;
+    }
+    .robot-message { min-height: 54px; padding: 10px 12px; color: #c9d1d9; background: #0d1117; border-top: 1px solid #30363d; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+    @media (max-width: 1100px) { main { grid-template-columns: 1fr; } img { height: auto; } .toolbar { grid-template-columns: repeat(2, 1fr); } }
   </style>
 </head>
 <body>
   <header>
-    <strong>RealSense Preview</strong>
-    <span id="status">connecting...</span>
-    <button onclick="snapshot()">保存截图</button>
-    <button onclick="moveInitial()">回初始位置</button>
+    <div class="brand">
+      <strong>RM65 方向盘中心孔插入控制台</strong>
+      <span>视觉识别 · 法向对齐 · 预插入 · VLA 数据采集</span>
+    </div>
+    <div class="top-status">
+      <span id="status" class="pill warn">连接中</span>
+      <span id="fpsTop" class="pill">FPS --</span>
+      <span id="recordTop" class="pill">未录制</span>
+      <button class="danger" onclick="robotStop()">急停</button>
+    </div>
   </header>
   <main>
-    <img src="/color.mjpg" alt="RealSense color stream">
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">相机实时画面</div>
+        <button id="yoloBtn" class="secondary" onclick="toggleYolo()">显示 YOLO</button>
+      </div>
+      <div class="camera-wrap"><img src="/color.mjpg" alt="RealSense color stream"></div>
+      <div class="toolbar">
+        <button class="secondary" onclick="snapshot()">保存截图</button>
+        <button class="secondary" onclick="moveInitial()">回初始位</button>
+        <button onclick="runNormalAlignPreinsert()">法向对齐姿态</button>
+        <button onclick="runLastPlanPreinsert()">按计划预插入</button>
+        <button class="success" onclick="runLastPlanInsert()">插入 10mm</button>
+      </div>
+    </div>
     <aside>
-      <div class="row"><span class="k">Color</span><span id="color"></span></div>
-      <div class="row"><span class="k">Depth</span><span id="depth"></span></div>
-      <div class="row"><span class="k">FPS</span><span id="fps"></span></div>
-      <div class="row"><span class="k">Last frame</span><span id="last"></span></div>
-      <div class="row"><span class="k">Snapshot</span><span id="shot"></span></div>
-      <div class="row"><span class="k">Robot</span><span id="robot"></span></div>
+      <section>
+        <h2>识别状态</h2>
+        <div class="rows">
+          <div class="row"><span class="k">彩色分辨率</span><span id="color" class="v"></span></div>
+          <div class="row"><span class="k">深度图</span><span id="depth" class="v"></span></div>
+          <div class="row"><span class="k">最近帧</span><span id="last" class="v"></span></div>
+          <div class="row"><span class="k">YOLO</span><span id="yolo" class="v"></span></div>
+          <div class="row"><span class="k">置信度</span><span id="score" class="v"></span></div>
+          <div class="row"><span class="k">中心像素</span><span id="center" class="v"></span></div>
+          <div class="row"><span class="k">手眼标定</span><span id="handEye" class="v"></span></div>
+        </div>
+      </section>
+      <section>
+        <h2>运动流程</h2>
+        <div class="stack">
+          <button onclick="runLivePreinsert()">实时预插入</button>
+          <button onclick="runRollSearchPreinsert()">保持姿态预插入</button>
+          <button onclick="runNormalAlignPreinsert()">法向对齐姿态</button>
+          <button onclick="runLastPlanPreinsert()">按计划预插入</button>
+        </div>
+      </section>
+      <section>
+        <h2>速度配置</h2>
+        <div class="speed-grid">
+          <div class="speed-field">
+            <label for="initialSpeed">回初始位速度</label>
+            <input id="initialSpeed" type="number" min="1" max="100" step="1" value="50">
+          </div>
+          <div class="speed-field">
+            <label for="movejSpeed">MoveJ 速度</label>
+            <input id="movejSpeed" type="number" min="1" max="100" step="1" value="20">
+          </div>
+          <div class="speed-field">
+            <label for="insertSpeed">插入速度</label>
+            <input id="insertSpeed" type="number" min="1" max="100" step="1" value="10">
+          </div>
+        </div>
+      </section>
+      <section>
+        <h2>夹爪与保存</h2>
+        <div class="stack">
+          <button class="secondary" onclick="gripperOpen()">打开夹爪</button>
+          <button class="secondary" onclick="gripperClose()">关闭夹爪</button>
+          <button id="recordStartBtn" class="record" onclick="recordStart()">开始保存</button>
+          <button id="recordStopBtn" class="warn" onclick="recordStop()">停止保存</button>
+        </div>
+        <div class="rows">
+          <div class="row"><span class="k">保存状态</span><span id="recording" class="v"></span></div>
+          <div class="row"><span class="k">帧数</span><span id="recordFrames" class="v"></span></div>
+          <div class="row"><span class="k">输出目录</span><span id="recordPath" class="v"></span></div>
+          <div class="row"><span class="k">截图</span><span id="shot" class="v"></span></div>
+        </div>
+      </section>
+      <section>
+        <h2>机器人状态</h2>
+        <div id="robot" class="robot-message"></div>
+      </section>
     </aside>
   </main>
   <script>
+    let speedDefaultsLoaded = false;
+    function speedPayload() {
+      return {
+        initial_movej_speed: Number(document.getElementById('initialSpeed').value || 50),
+        movej_speed: Number(document.getElementById('movejSpeed').value || 20),
+        frontend_insert_speed: Number(document.getElementById('insertSpeed').value || 10),
+      };
+    }
+    async function postJson(url, payload = null) {
+      const options = {method: 'POST'};
+      if (payload !== null) {
+        options.headers = {'Content-Type': 'application/json'};
+        options.body = JSON.stringify(payload);
+      }
+      const r = await fetch(url, options);
+      return await r.json();
+    }
     async function refresh() {
       try {
         const r = await fetch('/status');
         const s = await r.json();
-        document.getElementById('status').textContent = s.running ? 'running' : 'stopped';
-        document.getElementById('color').textContent = `${s.width}x${s.height}`;
-        document.getElementById('depth').textContent = s.depth_ready ? 'ready' : 'none';
-        document.getElementById('fps').textContent = s.actual_fps.toFixed(1);
+        document.getElementById('status').textContent = s.running ? '相机运行' : '相机停止';
+        document.getElementById('status').className = s.running ? 'pill ok' : 'pill warn';
+        document.getElementById('color').textContent = `${s.width} x ${s.height}`;
+        document.getElementById('depth').textContent = s.depth_ready ? '正常' : '无数据';
+        document.getElementById('fpsTop').textContent = `FPS ${s.actual_fps.toFixed(1)}`;
         document.getElementById('last').textContent = s.last_frame_time || '';
+        document.getElementById('yolo').textContent = s.yolo_enabled ? (s.yolo_found ? '已识别' : '开启') : '关闭';
+        document.getElementById('score').textContent = s.yolo_score == null ? '' : s.yolo_score.toFixed(3);
+        document.getElementById('center').textContent = s.yolo_center ? `[${s.yolo_center[0].toFixed(1)}, ${s.yolo_center[1].toFixed(1)}]` : '';
+        document.getElementById('handEye').textContent = s.hand_eye_valid ? '有效' : '无效';
+        document.getElementById('yoloBtn').textContent = s.yolo_enabled ? '隐藏 YOLO' : '显示 YOLO';
+        document.getElementById('recording').textContent = s.recording ? '录制中' : '未录制';
+        document.getElementById('recordTop').textContent = s.recording ? '录制中' : '未录制';
+        document.getElementById('recordTop').className = s.recording ? 'pill ok' : 'pill';
+        document.getElementById('recordFrames').textContent = String(s.record_frames || 0);
+        document.getElementById('recordPath').textContent = s.record_path || '';
+        if (!speedDefaultsLoaded && s.speed_defaults) {
+          document.getElementById('initialSpeed').value = s.speed_defaults.initial_movej_speed;
+          document.getElementById('movejSpeed').value = s.speed_defaults.movej_speed;
+          document.getElementById('insertSpeed').value = s.speed_defaults.frontend_insert_speed;
+          speedDefaultsLoaded = true;
+        }
+        const rr = await fetch('/robot/status');
+        const rs = await rr.json();
+        document.getElementById('robot').textContent = rs.busy ? `执行中：${rs.message || ''}` : (rs.message || '空闲');
       } catch (e) {
-        document.getElementById('status').textContent = 'offline';
+        document.getElementById('status').textContent = '离线';
+        document.getElementById('status').className = 'pill warn';
       }
     }
     async function snapshot() {
-      const r = await fetch('/snapshot', {method: 'POST'});
-      const s = await r.json();
+      const s = await postJson('/snapshot');
       document.getElementById('shot').textContent = s.path || s.error || '';
     }
     async function moveInitial() {
-      if (!confirm('确认让机械臂低速回到初始位置？')) return;
-      document.getElementById('robot').textContent = 'sending...';
-      const r = await fetch('/robot/move_initial', {method: 'POST'});
-      const s = await r.json();
+      if (!confirm(`确认让机械臂回到初始位置？速度=${speedPayload().initial_movej_speed}`)) return;
+      document.getElementById('robot').textContent = '发送回初始位指令...';
+      const s = await postJson('/robot/move_initial', speedPayload());
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function runLivePreinsert() {
+      if (!confirm(`确认使用当前 RGBD 画面识别并移动到预插入位置？MoveJ速度=${speedPayload().movej_speed}`)) return;
+      const s = await postJson('/robot/live_preinsert', speedPayload());
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function runRollSearchPreinsert() {
+      if (!confirm(`确认使用当前 RGBD 画面识别，并保持当前工具姿态移动到预插入位置？MoveJ速度=${speedPayload().movej_speed}`)) return;
+      const s = await postJson('/robot/live_preinsert_roll_search', speedPayload());
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function runNormalAlignPreinsert() {
+      if (!confirm(`确认使用当前 RGBD 画面识别，只旋转姿态对齐中间圆环法向？MoveJ速度=${speedPayload().movej_speed}`)) return;
+      const s = await postJson('/robot/live_preinsert_normal_align', speedPayload());
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function runLastPlanPreinsert() {
+      if (!confirm(`确认不重新拍照，读取上次法向对齐保存的计划，并移动到预插入位置？MoveJ速度=${speedPayload().movej_speed}`)) return;
+      const s = await postJson('/robot/move_last_plan_preinsert', speedPayload());
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function runLastPlanInsert() {
+      if (!confirm(`确认不重新拍照，读取上次预插入计划，并沿当前工具轴小步前伸 10mm？插入速度=${speedPayload().frontend_insert_speed}`)) return;
+      const s = await postJson('/robot/insert_last_plan', speedPayload());
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function robotStop() {
+      const s = await postJson('/robot/stop');
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function gripperOpen() {
+      if (!confirm('确认打开夹爪？')) return;
+      const s = await postJson('/gripper/open');
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function gripperClose() {
+      if (!confirm('确认关闭夹爪？')) return;
+      const s = await postJson('/gripper/close');
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function toggleYolo() {
+      const s = await postJson('/yolo/toggle');
+      document.getElementById('yolo').textContent = s.enabled ? '开启' : '关闭';
+    }
+    async function recordStart() {
+      const s = await postJson('/recording/start');
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function recordStop() {
+      const s = await postJson('/recording/stop');
       document.getElementById('robot').textContent = s.message || s.error || '';
     }
     setInterval(refresh, 1000);
@@ -95,9 +351,16 @@ class RealSenseStreamer:
         self.lock = threading.Lock()
         self.color = None
         self.depth_m = None
+        self.color_intrinsics = None
+        self.depth_scale = None
+        self.display = None
         self.running = False
         self.last_frame_time = ""
         self.actual_fps = 0.0
+        self.yolo_enabled = False
+        self.yolo_result = None
+        self.yolo_last_time = 0.0
+        self.yolo_net = None
         self._thread = None
         self._pipeline = None
 
@@ -119,6 +382,11 @@ class RealSenseStreamer:
         align = rs.align(rs.stream.color)
         self._pipeline = pipeline
         depth_scale = float(profile.get_device().first_depth_sensor().get_depth_scale())
+        color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
+        color_intrinsics = intrinsics_to_dict(color_stream.get_intrinsics())
+        with self.lock:
+            self.depth_scale = depth_scale
+            self.color_intrinsics = color_intrinsics
         last_t = time.time()
         try:
             for _ in range(max(0, int(self.args.warmup))):
@@ -142,15 +410,137 @@ class RealSenseStreamer:
                     self.depth_m = depth_m
                     self.actual_fps = 0.9 * self.actual_fps + 0.1 * (1.0 / dt) if self.actual_fps else 1.0 / dt
                     self.last_frame_time = time.strftime("%H:%M:%S")
+                    yolo_enabled = self.yolo_enabled
+                    yolo_due = now - self.yolo_last_time >= float(self.args.yolo_interval)
+                if yolo_enabled and yolo_due:
+                    self._update_yolo(color, now)
         finally:
             pipeline.stop()
             self.running = False
+
+    def _load_yolo_net(self):
+        if self.yolo_net is None:
+            self.yolo_net = cv2.dnn.readNetFromONNX(str(Path(self.args.model).expanduser().resolve()))
+        return self.yolo_net
+
+    def _infer_yolo_mask(self, image):
+        orig_h, orig_w = image.shape[:2]
+        imgsz = int(self.args.imgsz)
+        inp, scale, pad_x, pad_y = letterbox(image, imgsz)
+        blob = cv2.dnn.blobFromImage(inp, 1.0 / 255.0, (imgsz, imgsz), swapRB=True, crop=False)
+        net = self._load_yolo_net()
+        net.setInput(blob)
+        pred, proto = net.forward(net.getUnconnectedOutLayersNames())
+        pred = pred[0].transpose(1, 0)
+        proto = proto[0]
+
+        boxes = []
+        scores = []
+        coeffs = []
+        for row in pred:
+            score = float(row[4])
+            if score < float(self.args.yolo_conf):
+                continue
+            cx, cy, bw, bh = [float(v) for v in row[:4]]
+            boxes.append([cx - bw / 2.0, cy - bh / 2.0, cx + bw / 2.0, cy + bh / 2.0])
+            scores.append(score)
+            coeffs.append(row[5:].astype(np.float32))
+        if not boxes:
+            return None
+
+        boxes = np.asarray(boxes, dtype=np.float32)
+        scores = np.asarray(scores, dtype=np.float32)
+        coeffs = np.asarray(coeffs, dtype=np.float32)
+        keep = nms(boxes, scores, float(self.args.yolo_iou))
+        if not keep:
+            return None
+        best = max(keep, key=lambda idx: float(scores[idx]))
+
+        proto_flat = proto.reshape(proto.shape[0], -1)
+        mask_logits = coeffs[best] @ proto_flat
+        mask = sigmoid(mask_logits).reshape(proto.shape[1], proto.shape[2])
+        mask = cv2.resize(mask, (imgsz, imgsz), interpolation=cv2.INTER_LINEAR)
+        mask_u8 = (mask >= float(self.args.mask_threshold)).astype(np.uint8)
+        mask_u8 = crop_mask_to_box(mask_u8, boxes[best])
+
+        unpad_h = int(round(orig_h * scale))
+        unpad_w = int(round(orig_w * scale))
+        unpad = mask_u8[pad_y:pad_y + unpad_h, pad_x:pad_x + unpad_w]
+        mask_orig = cv2.resize(unpad, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+        contours, _ = cv2.findContours((mask_orig * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+        contour = max(contours, key=cv2.contourArea)
+        moments = cv2.moments(contour)
+        center = None
+        if abs(float(moments["m00"])) > 1e-6:
+            center = [float(moments["m10"] / moments["m00"]), float(moments["m01"] / moments["m00"])]
+
+        box = boxes[best].copy()
+        box[[0, 2]] = (box[[0, 2]] - pad_x) / scale
+        box[[1, 3]] = (box[[1, 3]] - pad_y) / scale
+        box[[0, 2]] = np.clip(box[[0, 2]], 0, orig_w - 1)
+        box[[1, 3]] = np.clip(box[[1, 3]], 0, orig_h - 1)
+        return {
+            "mask": mask_orig.astype(bool),
+            "contour": contour,
+            "score": float(scores[best]),
+            "center": center,
+            "box": [float(v) for v in box],
+        }
+
+    def _draw_yolo_overlay(self, image, result):
+        overlay = image.copy()
+        if result is None:
+            cv2.putText(overlay, "YOLO: no center_hole", (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+            return overlay
+        green = np.zeros_like(image)
+        green[:, :, 1] = 255
+        mask = result["mask"]
+        overlay = np.where(mask[:, :, None], cv2.addWeighted(image, 0.62, green, 0.38, 0), overlay)
+        cv2.drawContours(overlay, [result["contour"]], -1, (0, 255, 0), 2)
+        x1, y1, x2, y2 = [int(round(v)) for v in result["box"]]
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        if result["center"] is not None:
+            cx, cy = [int(round(v)) for v in result["center"]]
+            cv2.drawMarker(overlay, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 28, 2)
+        cv2.putText(overlay, f"YOLO center_hole score={result['score']:.3f}", (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 3)
+        cv2.putText(overlay, f"YOLO center_hole score={result['score']:.3f}", (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 0), 1)
+        return overlay
+
+    def _update_yolo(self, color, timestamp):
+        try:
+            result = self._infer_yolo_mask(color)
+            display = self._draw_yolo_overlay(color, result)
+        except Exception as exc:
+            result = {"error": str(exc), "score": None, "center": None}
+            display = color.copy()
+            cv2.putText(display, f"YOLO error: {exc}", (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
+        with self.lock:
+            self.yolo_result = result
+            self.display = display
+            self.yolo_last_time = timestamp
+
+    def set_yolo_enabled(self, enabled):
+        with self.lock:
+            self.yolo_enabled = bool(enabled)
+            if not self.yolo_enabled:
+                self.display = None
+                self.yolo_result = None
+        return self.yolo_enabled
+
+    def toggle_yolo(self):
+        with self.lock:
+            enabled = not self.yolo_enabled
+        return self.set_yolo_enabled(enabled)
 
     def get_jpeg(self):
         with self.lock:
             if self.color is None:
                 frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 cv2.putText(frame, "waiting for RealSense...", (40, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            elif self.yolo_enabled and self.display is not None:
+                frame = self.display.copy()
             else:
                 frame = self.color.copy()
         ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), int(self.args.jpeg_quality)])
@@ -173,9 +563,49 @@ class RealSenseStreamer:
             np.save(str(out_dir / f"{stem}_depth_m.npy"), depth_m)
         return color_path
 
+    def get_record_frame(self):
+        with self.lock:
+            if self.color is None:
+                return None
+            color = self.color.copy()
+            intr = None if self.color_intrinsics is None else dict(self.color_intrinsics)
+            frame_time = self.last_frame_time
+        return color, intr, frame_time
+
+    def save_current_capture(self, root):
+        with self.lock:
+            if self.color is None or self.depth_m is None or self.color_intrinsics is None:
+                return None
+            color = self.color.copy()
+            depth_m = self.depth_m.copy()
+            color_intrinsics = dict(self.color_intrinsics)
+            depth_scale = self.depth_scale
+        out_dir = Path(root).expanduser().resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out_dir / "color.png"), color)
+        np.save(str(out_dir / "depth_raw.npy"), depth_m)
+        depth_mm = np.rint(depth_m * 1000.0).astype(np.uint16)
+        cv2.imwrite(str(out_dir / "depth_mm.png"), depth_mm)
+        meta = {
+            "capture_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "realsense_preview_server",
+            "depth_scale_m_per_unit": float(depth_scale) if depth_scale is not None else None,
+            "streams_aligned_to": "color",
+            "color_intrinsics": color_intrinsics,
+            "files": {
+                "color": "color.png",
+                "depth_raw_m": "depth_raw.npy",
+                "depth_mm": "depth_mm.png",
+            },
+        }
+        with open(out_dir / "intrinsics.json", "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+        return out_dir
+
     def status(self):
         with self.lock:
             h, w = self.color.shape[:2] if self.color is not None else (self.args.height, self.args.width)
+            yolo_result = self.yolo_result or {}
             return {
                 "running": bool(self.running),
                 "width": int(w),
@@ -183,23 +613,250 @@ class RealSenseStreamer:
                 "depth_ready": self.depth_m is not None,
                 "actual_fps": float(self.actual_fps),
                 "last_frame_time": self.last_frame_time,
+                "yolo_enabled": bool(self.yolo_enabled),
+                "yolo_found": bool(yolo_result and yolo_result.get("center") is not None),
+                "yolo_score": yolo_result.get("score"),
+                "yolo_center": yolo_result.get("center"),
             }
+
+
+class EpisodeRecorder:
+    def __init__(self, streamer, args):
+        self.streamer = streamer
+        self.args = args
+        self.lock = threading.Lock()
+        self.recording = False
+        self.frame_count = 0
+        self.episode_dir = None
+        self.message = ""
+        self._thread = None
+        self._stop_event = threading.Event()
+
+    def status(self):
+        with self.lock:
+            return {
+                "recording": bool(self.recording),
+                "record_frames": int(self.frame_count),
+                "record_path": "" if self.episode_dir is None else str(self.episode_dir),
+                "record_message": self.message,
+            }
+
+    def start(self):
+        with self.lock:
+            if self.recording:
+                return False, f"已经在保存: {self.episode_dir}"
+            self._stop_event.clear()
+            root = Path(self.args.recording_dir).expanduser().resolve()
+            root.mkdir(parents=True, exist_ok=True)
+            existing = sorted(root.glob("episode_*"))
+            next_index = len(existing)
+            episode_dir = root / f"episode_{next_index:06d}"
+            episode_dir.mkdir(parents=True, exist_ok=False)
+            (episode_dir / "videos").mkdir()
+            (episode_dir / "data").mkdir()
+            (episode_dir / "meta").mkdir()
+            self.episode_dir = episode_dir
+            self.frame_count = 0
+            self.message = "保存中"
+            self.recording = True
+            self._thread = threading.Thread(target=self._run, args=(episode_dir, next_index), daemon=True)
+            self._thread.start()
+            return True, f"开始保存: {episode_dir}"
+
+    def stop(self):
+        with self.lock:
+            if not self.recording:
+                return False, "当前没有保存任务"
+            episode_dir = self.episode_dir
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=8.0)
+        with self.lock:
+            msg = f"保存完成: {episode_dir}"
+            self.message = msg
+            return True, msg
+
+    def _read_robot_state(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(float(self.args.recording_robot_timeout_s))
+            sock.connect((self.args.robot_ip, int(self.args.robot_port)))
+            state = get_current_state(sock)
+        finally:
+            sock.close()
+        if not state:
+            return None, None
+        pose, joint = state
+        return [float(x) for x in pose], [float(x) for x in joint]
+
+    def _write_meta(self, episode_dir, episode_index, frame_count, fps, intrinsics):
+        meta_dir = episode_dir / "meta"
+        info = {
+            "codebase_version": "lerobot-like-v0",
+            "robot_type": "rm65b",
+            "fps": float(fps),
+            "total_episodes": 1,
+            "total_frames": int(frame_count),
+            "data_path": "data/frames.jsonl",
+            "video_path": "videos/camera_rgb.mp4",
+            "features": {
+                "observation.images.camera_rgb": {"dtype": "video", "shape": [int(self.args.height), int(self.args.width), 3]},
+                "observation.state": {"dtype": "float32", "shape": [12], "names": ["x", "y", "z", "rx", "ry", "rz", "j1", "j2", "j3", "j4", "j5", "j6"]},
+                "timestamp": {"dtype": "float64", "shape": [1]},
+                "frame_index": {"dtype": "int64", "shape": [1]},
+            },
+        }
+        episode = {
+            "episode_index": int(episode_index),
+            "length": int(frame_count),
+            "task": "方向盘中心孔插入",
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "color_intrinsics": intrinsics,
+        }
+        tasks = [{"task_index": 0, "task": "方向盘中心孔插入"}]
+        with open(meta_dir / "info.json", "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=2, ensure_ascii=False)
+        with open(meta_dir / "episode.json", "w", encoding="utf-8") as f:
+            json.dump(episode, f, indent=2, ensure_ascii=False)
+        with open(meta_dir / "tasks.jsonl", "w", encoding="utf-8") as f:
+            for item in tasks:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+    def _try_write_parquet(self, rows, out_path):
+        try:
+            import pandas as pd  # noqa: WPS433
+            df = pd.DataFrame(rows)
+            df.to_parquet(out_path, index=False)
+            return True, ""
+        except Exception as exc:
+            return False, str(exc)
+
+    def _run(self, episode_dir, episode_index):
+        fps = float(self.args.recording_fps)
+        period = 1.0 / max(fps, 0.1)
+        frames_path = episode_dir / "data" / "frames.jsonl"
+        video_path = episode_dir / "videos" / "camera_rgb.mp4"
+        rows = []
+        writer = None
+        intrinsics = None
+        start_mono = time.monotonic()
+        start_unix = time.time()
+
+        try:
+            with open(frames_path, "w", encoding="utf-8") as frames_file:
+                next_t = time.monotonic()
+                while not self._stop_event.is_set():
+                    now = time.monotonic()
+                    if now < next_t:
+                        time.sleep(min(next_t - now, 0.02))
+                        continue
+                    next_t += period
+
+                    frame_pack = self.streamer.get_record_frame()
+                    if frame_pack is None:
+                        continue
+                    color, intr, camera_frame_time = frame_pack
+                    intrinsics = intrinsics or intr
+                    pose, joint = self._read_robot_state()
+                    if pose is None or joint is None:
+                        continue
+
+                    if writer is None:
+                        h, w = color.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        writer = cv2.VideoWriter(str(video_path), fourcc, fps, (w, h))
+                        if not writer.isOpened():
+                            raise RuntimeError(f"Cannot open video writer: {video_path}")
+
+                    frame_index = len(rows)
+                    timestamp = time.time() - start_unix
+                    writer.write(color)
+                    row = {
+                        "episode_index": int(episode_index),
+                        "frame_index": int(frame_index),
+                        "timestamp": float(timestamp),
+                        "monotonic_time": float(time.monotonic() - start_mono),
+                        "camera_frame_time": camera_frame_time,
+                        "observation.state": [float(x) for x in (pose + joint)],
+                        "observation.robot_pose": pose,
+                        "observation.robot_joint_deg": joint,
+                        "observation.images.camera_rgb": "videos/camera_rgb.mp4",
+                    }
+                    rows.append(row)
+                    frames_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    frames_file.flush()
+                    with self.lock:
+                        self.frame_count = len(rows)
+
+            if writer is not None:
+                writer.release()
+                writer = None
+            parquet_ok, parquet_error = self._try_write_parquet(rows, episode_dir / "data" / "frames.parquet")
+            self._write_meta(episode_dir, episode_index, len(rows), fps, intrinsics)
+            with open(episode_dir / "README.md", "w", encoding="utf-8") as f:
+                f.write("# RM65 steering wheel insertion episode\n\n")
+                f.write("LeRobot-like layout: video in `videos/`, synchronized robot state rows in `data/frames.jsonl`.\n")
+                if not parquet_ok:
+                    f.write(f"\nParquet was not written: {parquet_error}\n")
+            with self.lock:
+                self.message = f"保存完成，帧数 {len(rows)}"
+        except Exception as exc:
+            if writer is not None:
+                writer.release()
+            with self.lock:
+                self.message = f"保存失败: {exc}"
+        finally:
+            with self.lock:
+                self.recording = False
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8090)
-    parser.add_argument("--serial", default="")
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--warmup", type=int, default=15)
+    parser.add_argument("--serial", default=cfg_get(CONFIG, "camera", "serial", default=""))
+    parser.add_argument("--width", type=int, default=int(cfg_get(CONFIG, "camera", "width", default=1280)))
+    parser.add_argument("--height", type=int, default=int(cfg_get(CONFIG, "camera", "height", default=720)))
+    parser.add_argument("--fps", type=int, default=int(cfg_get(CONFIG, "camera", "fps", default=30)))
+    parser.add_argument("--warmup", type=int, default=int(cfg_get(CONFIG, "camera", "warmup", default=15)))
     parser.add_argument("--jpeg-quality", type=int, default=85)
-    parser.add_argument("--snapshot-dir", default=str(SCRIPT_DIR / "preview_snapshots"))
-    parser.add_argument("--robot-ip", default="169.254.128.21")
-    parser.add_argument("--robot-port", type=int, default=8080)
-    parser.add_argument("--initial-movej-speed", type=int, default=5)
+    parser.add_argument("--snapshot-dir", default=str(relative_path(CONFIG, "paths", "snapshot_dir", default="preview_snapshots")))
+    parser.add_argument("--frontend-run-dir", default=str(relative_path(CONFIG, "paths", "frontend_run_dir", default="frontend_runs")))
+    parser.add_argument("--model", default=str(DEFAULT_MODEL))
+    parser.add_argument("--imgsz", type=int, default=int(cfg_get(CONFIG, "detection", "imgsz", default=960)))
+    parser.add_argument("--yolo-conf", type=float, default=float(cfg_get(CONFIG, "detection", "yolo_conf", default=0.05)))
+    parser.add_argument("--yolo-iou", type=float, default=float(cfg_get(CONFIG, "detection", "yolo_iou", default=0.45)))
+    parser.add_argument("--mask-threshold", type=float, default=float(cfg_get(CONFIG, "detection", "mask_threshold", default=0.5)))
+    parser.add_argument("--yolo-interval", type=float, default=0.7,
+                        help="Seconds between YOLO overlay updates when enabled.")
+    parser.add_argument("--robot-ip", default=cfg_get(CONFIG, "robot", "ip", default="169.254.128.21"))
+    parser.add_argument("--robot-port", type=int, default=int(cfg_get(CONFIG, "robot", "port", default=8080)))
+    parser.add_argument("--initial-movej-speed", type=int, default=int(cfg_get(CONFIG, "motion", "initial_movej_speed", default=50)))
+    parser.add_argument("--right-offset-m", type=float, default=float(cfg_get(CONFIG, "insertion", "observed_right_offset_m", default=0.0025)))
+    parser.add_argument("--up-offset-m", type=float, default=float(cfg_get(CONFIG, "insertion", "observed_up_offset_m", default=0.0030)))
+    parser.add_argument("--tcp-to-tip-m", type=float, default=float(cfg_get(CONFIG, "tool", "tcp_to_tip_m", default=0.1613)))
+    parser.add_argument("--tip-tcp-m", default=",".join(str(x) for x in cfg_get(CONFIG, "tool", "tip_tcp_m", default=[])))
+    parser.add_argument("--preinsert-distance-m", type=float, default=float(cfg_get(CONFIG, "insertion", "preinsert_distance_m", default=0.08)))
+    parser.add_argument("--insert-depth-m", type=float, default=float(cfg_get(CONFIG, "insertion", "insert_depth_m", default=0.002)))
+    parser.add_argument("--max-preinsert-move-m", type=float, default=float(cfg_get(CONFIG, "insertion", "max_preinsert_move_m", default=0.35)))
+    parser.add_argument("--movej-speed", type=int, default=int(cfg_get(CONFIG, "motion", "movej_speed", default=20)))
+    parser.add_argument("--max-j6-step-deg", type=float, default=float(cfg_get(CONFIG, "motion", "max_j6_step_deg", default=90.0)))
+    parser.add_argument("--roll-search-deg", default="0,15,-15,30,-30,45,-45,60,-60,90,-90,120,-120,150,-150,180",
+                        help="Comma-separated wrist roll candidates for the roll-search preinsert button.")
+    parser.add_argument("--gripper-device-id", type=int, default=int(cfg_get(CONFIG, "gripper", "device_id", default=9)))
+    parser.add_argument("--gripper-open-position", type=int, default=int(cfg_get(CONFIG, "gripper", "open_position", default=255)),
+                        help="Frontend corrected value for opening the reversed gripper.")
+    parser.add_argument("--gripper-close-position", type=int, default=int(cfg_get(CONFIG, "gripper", "close_position", default=0)),
+                        help="Frontend corrected value for closing the reversed gripper.")
+    parser.add_argument("--gripper-speed", type=int, default=int(cfg_get(CONFIG, "gripper", "speed", default=255)))
+    parser.add_argument("--gripper-force", type=int, default=int(cfg_get(CONFIG, "gripper", "force", default=255)))
+    parser.add_argument("--gripper-timeout-s", type=int, default=int(cfg_get(CONFIG, "gripper", "timeout_s", default=5)))
+    parser.add_argument("--frontend-insert-distance-m", type=float, default=float(cfg_get(CONFIG, "insertion", "frontend_insert_distance_m", default=0.01)))
+    parser.add_argument("--frontend-max-insert-distance-m", type=float, default=float(cfg_get(CONFIG, "insertion", "frontend_max_insert_distance_m", default=0.01)))
+    parser.add_argument("--frontend-insert-speed", type=int, default=int(cfg_get(CONFIG, "motion", "frontend_insert_speed", default=10)))
+    parser.add_argument("--recording-dir", default=str(relative_path(CONFIG, "paths", "recording_dir", default="vla_recordings")))
+    parser.add_argument("--recording-fps", type=float, default=float(cfg_get(CONFIG, "recording", "fps", default=10.0)))
+    parser.add_argument("--recording-robot-timeout-s", type=float, default=float(cfg_get(CONFIG, "recording", "robot_timeout_s", default=1.0)))
     return parser.parse_args()
 
 
@@ -207,10 +864,27 @@ def main():
     args = parse_args()
     streamer = RealSenseStreamer(args)
     streamer.start()
+    recorder = EpisodeRecorder(streamer, args)
     robot_lock = threading.Lock()
-    robot_state = {"busy": False, "message": ""}
+    robot_state = {"busy": False, "message": "", "last_plan": ""}
 
     app = Flask(__name__)
+
+    def speed_from_request(name, default_value):
+        payload = request.get_json(silent=True) or {}
+        value = payload.get(name, default_value)
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = int(default_value)
+        return max(1, min(100, value))
+
+    def request_speed_config():
+        return {
+            "initial_movej_speed": speed_from_request("initial_movej_speed", args.initial_movej_speed),
+            "movej_speed": speed_from_request("movej_speed", args.movej_speed),
+            "frontend_insert_speed": speed_from_request("frontend_insert_speed", args.frontend_insert_speed),
+        }
 
     @app.route("/")
     def index():
@@ -218,7 +892,15 @@ def main():
 
     @app.route("/status")
     def status():
-        return jsonify(streamer.status())
+        data = streamer.status()
+        data.update(recorder.status())
+        data["speed_defaults"] = {
+            "initial_movej_speed": int(args.initial_movej_speed),
+            "movej_speed": int(args.movej_speed),
+            "frontend_insert_speed": int(args.frontend_insert_speed),
+        }
+        data["hand_eye_valid"] = bool(cfg_get(CONFIG, "hand_eye", "valid", default=False))
+        return jsonify(data)
 
     @app.route("/snapshot", methods=["POST"])
     def snapshot():
@@ -227,26 +909,39 @@ def main():
             return jsonify({"ok": False, "error": "no frame yet"}), 503
         return jsonify({"ok": True, "path": str(path)})
 
+    @app.route("/recording/start", methods=["POST"])
+    def recording_start():
+        ok, message = recorder.start()
+        status_code = 200 if ok else 409
+        return jsonify({"ok": ok, "message": message, "error": "" if ok else message}), status_code
+
+    @app.route("/recording/stop", methods=["POST"])
+    def recording_stop():
+        ok, message = recorder.stop()
+        status_code = 200 if ok else 409
+        return jsonify({"ok": ok, "message": message, "error": "" if ok else message}), status_code
+
     @app.route("/robot/move_initial", methods=["POST"])
     def move_initial():
+        speed_config = request_speed_config()
         with robot_lock:
             if robot_state["busy"]:
                 return jsonify({"ok": False, "error": "robot command already running"}), 409
             robot_state["busy"] = True
-            robot_state["message"] = "moving to initial pose"
+            robot_state["message"] = f"moving to initial pose, speed={speed_config['initial_movej_speed']}"
 
         def worker():
             mover = Rm65SafeIkMover(
                 robot_ip=args.robot_ip,
                 robot_port=args.robot_port,
-                speed=args.initial_movej_speed,
+                speed=speed_config["initial_movej_speed"],
                 max_joint_step_deg=120,
                 max_j6_step_deg=120,
             )
             try:
                 mover.connect()
                 ret = mover.movej(INITIAL_JOINT_DEG)
-                msg = f"move_initial ret={ret}"
+                msg = f"move_initial ret={ret}, speed={speed_config['initial_movej_speed']}"
             except Exception as exc:
                 msg = f"move_initial error: {exc}"
             finally:
@@ -258,12 +953,266 @@ def main():
                         robot_state["message"] = msg
 
         threading.Thread(target=worker, daemon=True).start()
-        return jsonify({"ok": True, "message": "moving to initial pose"})
+        return jsonify({"ok": True, "message": f"moving to initial pose, speed={speed_config['initial_movej_speed']}"})
+
+    @app.route("/robot/stop", methods=["POST"])
+    def robot_stop():
+        def worker():
+            mover = Rm65SafeIkMover(robot_ip=args.robot_ip, robot_port=args.robot_port, speed=1)
+            try:
+                mover.connect()
+                ret = mover.arm.rm_set_arm_stop()
+                msg = f"stop ret={ret}"
+            except Exception as exc:
+                msg = f"stop error: {exc}"
+            finally:
+                try:
+                    mover.close()
+                finally:
+                    with robot_lock:
+                        robot_state["busy"] = False
+                        robot_state["message"] = msg
+
+        with robot_lock:
+            robot_state["message"] = "stopping"
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({"ok": True, "message": "stop command sent"})
+
+    def start_gripper_action(action_name, position):
+        with robot_lock:
+            if robot_state["busy"]:
+                return jsonify({"ok": False, "error": "robot command already running"}), 409
+            robot_state["busy"] = True
+            robot_state["message"] = f"gripper {action_name} running"
+
+        def worker():
+            try:
+                set_right_gripper_modbus(
+                    robot_ip=args.robot_ip,
+                    robot_port=args.robot_port,
+                    position=int(position),
+                    force=int(args.gripper_force),
+                    speed=int(args.gripper_speed),
+                    device_id=int(args.gripper_device_id),
+                    timeout_s=int(args.gripper_timeout_s),
+                )
+                msg = f"gripper {action_name} ok, position={int(position)}"
+            except Exception as exc:
+                msg = f"gripper {action_name} error: {exc}"
+            finally:
+                with robot_lock:
+                    robot_state["busy"] = False
+                    robot_state["message"] = msg
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({"ok": True, "message": f"gripper {action_name} started"})
+
+    @app.route("/gripper/open", methods=["POST"])
+    def gripper_open():
+        return start_gripper_action("open", args.gripper_open_position)
+
+    @app.route("/gripper/close", methods=["POST"])
+    def gripper_close():
+        return start_gripper_action("close", args.gripper_close_position)
+
+    def start_live_preinsert(mode="normal"):
+        speed_config = request_speed_config()
+        with robot_lock:
+            if robot_state["busy"]:
+                return jsonify({"ok": False, "error": "robot command already running"}), 409
+            robot_state["busy"] = True
+            robot_state["message"] = f"{mode} preinsert running, movej_speed={speed_config['movej_speed']}"
+
+        def worker():
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            suffix = mode
+            run_root = Path(args.frontend_run_dir).expanduser().resolve() / f"frontend_{ts}_{suffix}"
+            capture_dir = run_root / "capture"
+            result_dir = run_root / "result"
+            result_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                saved_capture = streamer.save_current_capture(capture_dir)
+                if saved_capture is None:
+                    raise RuntimeError("no RGBD frame ready")
+                stem = f"frontend_yolo_{ts}"
+                detection_json = result_dir / f"{stem}_detection.json"
+                plan_json = result_dir / f"{stem}_plan.json"
+                detect_cmd = [
+                    sys.executable,
+                    str(SCRIPT_DIR / "detect_center_hole_yolo_rgbd.py"),
+                    str(saved_capture),
+                    "--out-dir", str(result_dir),
+                    "--out-stem", stem,
+                    "--conf", str(args.yolo_conf),
+                    "--min-confidence", "0.35",
+                ]
+                move_cmd = [
+                    sys.executable,
+                    str(SCRIPT_DIR / "move_to_center_hole.py"),
+                    "--detection", str(detection_json),
+                    "--observed-right-offset-m", str(args.right_offset_m),
+                    "--observed-up-offset-m", str(args.up_offset_m),
+                    "--tcp-to-tip-m", str(args.tcp_to_tip_m),
+                    "--tip-tcp-m", str(args.tip_tcp_m),
+                    "--preinsert-distance-m", str(args.preinsert_distance_m),
+                    "--insert-depth-m", str(args.insert_depth_m),
+                    "--max-preinsert-move-m", str(args.max_preinsert_move_m),
+                    "--movej-speed", str(speed_config["movej_speed"]),
+                    "--max-j6-step-deg", str(args.max_j6_step_deg),
+                    "--plan-out", str(plan_json),
+                    "--require-quality-ok",
+                    "--move-preinsert",
+                ]
+                if mode == "roll_search":
+                    move_cmd.extend([
+                        "--keep-current-orientation",
+                        "--roll-search-deg", str(args.roll_search_deg),
+                        "--controller-pose-fallback",
+                    ])
+                elif mode == "normal_align":
+                    move_cmd.extend([
+                        "--align-orientation-only",
+                        "--controller-pose-fallback",
+                    ])
+                subprocess.run(detect_cmd, check=True)
+                try:
+                    with open(detection_json, "r", encoding="utf-8") as f:
+                        detection_payload = json.load(f)
+                    if detection_payload.get("quality") != "ok":
+                        reasons = ", ".join(detection_payload.get("quality_reasons", [])) or "unknown"
+                        raise RuntimeError(
+                            f"detection quality={detection_payload.get('quality')}: {reasons}"
+                        )
+                except RuntimeError:
+                    raise
+                except Exception as exc:
+                    raise RuntimeError(f"failed to read detection quality: {exc}") from exc
+                subprocess.run(move_cmd, check=True)
+                msg = f"{suffix} ok: {run_root}"
+                last_plan = str(plan_json)
+            except Exception as exc:
+                msg = f"{suffix} error: {exc}"
+                last_plan = ""
+            finally:
+                with robot_lock:
+                    robot_state["busy"] = False
+                    robot_state["message"] = msg
+                    if last_plan:
+                        robot_state["last_plan"] = last_plan
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({"ok": True, "message": f"{mode} preinsert started, movej_speed={speed_config['movej_speed']}"})
+
+    @app.route("/robot/live_preinsert", methods=["POST"])
+    def live_preinsert():
+        return start_live_preinsert(mode="preinsert")
+
+    @app.route("/robot/live_preinsert_roll_search", methods=["POST"])
+    def live_preinsert_roll_search():
+        return start_live_preinsert(mode="roll_search")
+
+    @app.route("/robot/live_preinsert_normal_align", methods=["POST"])
+    def live_preinsert_normal_align():
+        return start_live_preinsert(mode="normal_align")
+
+    @app.route("/robot/move_last_plan_preinsert", methods=["POST"])
+    def move_last_plan_preinsert():
+        speed_config = request_speed_config()
+        with robot_lock:
+            if robot_state["busy"]:
+                return jsonify({"ok": False, "error": "robot command already running"}), 409
+            plan_path = robot_state.get("last_plan") or ""
+            if not plan_path or not Path(plan_path).exists():
+                latest = find_latest_frontend_plan(args.frontend_run_dir)
+                plan_path = str(latest) if latest else ""
+            if not plan_path:
+                return jsonify({"ok": False, "error": "no previous plan found"}), 404
+            robot_state["busy"] = True
+            robot_state["message"] = f"last-plan preinsert running, movej_speed={speed_config['movej_speed']}: {plan_path}"
+
+        def worker():
+            try:
+                preinsert_cmd = [
+                    sys.executable,
+                    str(SCRIPT_DIR / "move_to_center_hole.py"),
+                    "--plan-in", str(plan_path),
+                    "--max-preinsert-move-m", str(args.max_preinsert_move_m),
+                    "--movej-speed", str(speed_config["movej_speed"]),
+                    "--max-j6-step-deg", str(args.max_j6_step_deg),
+                    "--require-quality-ok",
+                    "--move-preinsert",
+                    "--controller-pose-fallback",
+                ]
+                subprocess.run(preinsert_cmd, check=True)
+                msg = f"last-plan preinsert ok: {plan_path}"
+            except Exception as exc:
+                msg = f"last-plan preinsert error: {exc}"
+            finally:
+                with robot_lock:
+                    robot_state["busy"] = False
+                    robot_state["message"] = msg
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({"ok": True, "message": f"last-plan preinsert started, movej_speed={speed_config['movej_speed']}: {plan_path}"})
+
+    @app.route("/robot/insert_last_plan", methods=["POST"])
+    def insert_last_plan():
+        speed_config = request_speed_config()
+        with robot_lock:
+            if robot_state["busy"]:
+                return jsonify({"ok": False, "error": "robot command already running"}), 409
+            plan_path = robot_state.get("last_plan") or ""
+            if not plan_path or not Path(plan_path).exists():
+                latest = find_latest_frontend_plan(args.frontend_run_dir)
+                plan_path = str(latest) if latest else ""
+            if not plan_path:
+                return jsonify({"ok": False, "error": "no previous plan found"}), 404
+            robot_state["busy"] = True
+            robot_state["message"] = f"insert running, speed={speed_config['frontend_insert_speed']}: {plan_path}"
+
+        def worker():
+            try:
+                insert_cmd = [
+                    sys.executable,
+                    str(SCRIPT_DIR / "continue_insert_along_axis.py"),
+                    "--plan", str(plan_path),
+                    "--distance-m", str(args.frontend_insert_distance_m),
+                    "--max-distance-m", str(args.frontend_max_insert_distance_m),
+                    "--axis-source", "current-tool",
+                    "--tool-axis", "+z",
+                    "--speed", str(speed_config["frontend_insert_speed"]),
+                    "--robot-ip", str(args.robot_ip),
+                    "--robot-port", str(args.robot_port),
+                ]
+                subprocess.run(insert_cmd, check=True)
+                msg = f"insert ok: {plan_path}"
+            except Exception as exc:
+                msg = f"insert error: {exc}"
+            finally:
+                with robot_lock:
+                    robot_state["busy"] = False
+                    robot_state["message"] = msg
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({"ok": True, "message": f"insert started, speed={speed_config['frontend_insert_speed']}: {plan_path}"})
 
     @app.route("/robot/status")
     def robot_status():
         with robot_lock:
             return jsonify(dict(robot_state))
+
+    @app.route("/yolo/toggle", methods=["POST"])
+    def yolo_toggle():
+        enabled = streamer.toggle_yolo()
+        return jsonify({"ok": True, "enabled": enabled})
+
+    @app.route("/yolo/on", methods=["POST"])
+    def yolo_on():
+        return jsonify({"ok": True, "enabled": streamer.set_yolo_enabled(True)})
+
+    @app.route("/yolo/off", methods=["POST"])
+    def yolo_off():
+        return jsonify({"ok": True, "enabled": streamer.set_yolo_enabled(False)})
 
     @app.route("/color.mjpg")
     def color_mjpg():

@@ -10,8 +10,13 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from config_loader import CONFIG, cfg_get, relative_path  # noqa: E402
+
 DEFAULT_PYTHON = "/home/wooshrobot/miniconda3/envs/cyy/bin/python"
-INITIAL_JOINT_DEG = [-9.144, 72.947, 94.574, -99.437, -88.530, -154.118]
+INITIAL_JOINT_DEG = [float(x) for x in cfg_get(CONFIG, "robot", "initial_joint_deg", default=[])]
 
 
 def run(cmd, capture_stdout=False):
@@ -63,36 +68,37 @@ def move_to_initial(args):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--python", default=DEFAULT_PYTHON)
-    parser.add_argument("--serial", default="")
-    parser.add_argument("--width", type=int, default=1280)
-    parser.add_argument("--height", type=int, default=720)
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--warmup", type=int, default=30)
-    parser.add_argument("--out-root", default=str(SCRIPT_DIR / "live_runs"))
-    parser.add_argument("--yolo-conf", type=float, default=0.05,
+    parser.add_argument("--serial", default=cfg_get(CONFIG, "camera", "serial", default=""))
+    parser.add_argument("--width", type=int, default=int(cfg_get(CONFIG, "camera", "width", default=1280)))
+    parser.add_argument("--height", type=int, default=int(cfg_get(CONFIG, "camera", "height", default=720)))
+    parser.add_argument("--fps", type=int, default=int(cfg_get(CONFIG, "camera", "fps", default=30)))
+    parser.add_argument("--warmup", type=int, default=int(cfg_get(CONFIG, "camera", "warmup", default=30)))
+    parser.add_argument("--out-root", default=str(relative_path(CONFIG, "paths", "live_run_dir", default="live_runs")))
+    parser.add_argument("--yolo-conf", type=float, default=float(cfg_get(CONFIG, "detection", "yolo_conf", default=0.05)),
                         help="Low-level YOLO candidate threshold. Lower values help produce an overlay for review.")
-    parser.add_argument("--min-confidence", type=float, default=0.35,
+    parser.add_argument("--min-confidence", type=float, default=float(cfg_get(CONFIG, "detection", "min_confidence", default=0.35)),
                         help="Quality threshold used by detection JSON before motion planning.")
-    parser.add_argument("--robot-ip", default="169.254.128.21")
-    parser.add_argument("--robot-port", type=int, default=8080)
-    parser.add_argument("--initial-movej-speed", type=int, default=5)
+    parser.add_argument("--robot-ip", default=cfg_get(CONFIG, "robot", "ip", default="169.254.128.21"))
+    parser.add_argument("--robot-port", type=int, default=int(cfg_get(CONFIG, "robot", "port", default=8080)))
+    parser.add_argument("--initial-movej-speed", type=int, default=int(cfg_get(CONFIG, "motion", "initial_movej_speed", default=5)))
     parser.add_argument("--skip-initial", action="store_true",
                         help="Do not move to the saved initial joint before capture.")
-    parser.add_argument("--right-offset-m", type=float, default=0.0025,
+    parser.add_argument("--right-offset-m", type=float, default=float(cfg_get(CONFIG, "insertion", "observed_right_offset_m", default=0.0025)),
                         help="Observed rod offset to the right of hole; target compensates left.")
-    parser.add_argument("--up-offset-m", type=float, default=0.0030,
+    parser.add_argument("--up-offset-m", type=float, default=float(cfg_get(CONFIG, "insertion", "observed_up_offset_m", default=0.0030)),
                         help="Observed rod offset above hole; target compensates down.")
-    parser.add_argument("--tcp-to-tip-m", type=float, default=0.20)
-    parser.add_argument("--preinsert-distance-m", type=float, default=0.08)
-    parser.add_argument("--insert-depth-m", type=float, default=0.002)
-    parser.add_argument("--max-preinsert-move-m", type=float, default=0.35)
-    parser.add_argument("--max-insert-move-m", type=float, default=0.10)
-    parser.add_argument("--max-insert-depth-m", type=float, default=0.003)
+    parser.add_argument("--tcp-to-tip-m", type=float, default=float(cfg_get(CONFIG, "tool", "tcp_to_tip_m", default=0.20)))
+    parser.add_argument("--tip-tcp-m", default=",".join(str(x) for x in cfg_get(CONFIG, "tool", "tip_tcp_m", default=[])))
+    parser.add_argument("--preinsert-distance-m", type=float, default=float(cfg_get(CONFIG, "insertion", "preinsert_distance_m", default=0.08)))
+    parser.add_argument("--insert-depth-m", type=float, default=float(cfg_get(CONFIG, "insertion", "insert_depth_m", default=0.002)))
+    parser.add_argument("--max-preinsert-move-m", type=float, default=float(cfg_get(CONFIG, "insertion", "max_preinsert_move_m", default=0.35)))
+    parser.add_argument("--max-insert-move-m", type=float, default=float(cfg_get(CONFIG, "insertion", "max_insert_move_m", default=0.10)))
+    parser.add_argument("--max-insert-depth-m", type=float, default=float(cfg_get(CONFIG, "insertion", "max_insert_depth_m", default=0.003)))
     parser.add_argument("--extra-insert-m", type=float, default=0.030,
                         help="Extra distance to continue past the YOLO final pose along insertion axis.")
-    parser.add_argument("--movej-speed", type=int, default=2)
-    parser.add_argument("--movel-speed", type=int, default=1)
-    parser.add_argument("--max-j6-step-deg", type=float, default=90.0)
+    parser.add_argument("--movej-speed", type=int, default=int(cfg_get(CONFIG, "motion", "movej_speed", default=2)))
+    parser.add_argument("--movel-speed", type=int, default=int(cfg_get(CONFIG, "motion", "movel_speed", default=1)))
+    parser.add_argument("--max-j6-step-deg", type=float, default=float(cfg_get(CONFIG, "motion", "max_j6_step_deg", default=90.0)))
     parser.add_argument("--allow-non-ok-quality", action="store_true")
     parser.add_argument("--require-quality-ok", action="store_true",
                         help="Require detector quality ok before moving.")
@@ -155,6 +161,7 @@ def main():
         "--observed-right-offset-m", str(args.right_offset_m),
         "--observed-up-offset-m", str(args.up_offset_m),
         "--tcp-to-tip-m", str(args.tcp_to_tip_m),
+        "--tip-tcp-m", str(args.tip_tcp_m),
         "--preinsert-distance-m", str(args.preinsert_distance_m),
         "--insert-depth-m", str(args.insert_depth_m),
         "--max-preinsert-move-m", str(args.max_preinsert_move_m),
