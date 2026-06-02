@@ -7,11 +7,15 @@ libs/web-log*
 *.log
 
 # Large local RGBD captures and generated validation overlays
+camera_service/captures/
 wheel_hole_insertion/captures/
+wheel_hole_insertion/frontend_runs/
+wheel_hole_insertion/live_runs/
 wheel_hole_insertion/label_dataset/depth_m/
 wheel_hole_insertion/label_dataset/images/
 wheel_hole_insertion/label_dataset/meta/
 wheel_hole_insertion/preview_snapshots/
+wheel_hole_insertion/vla_recordings/
 wheel_hole_insertion/stability_verify_A/captures/
 wheel_hole_insertion/stability_verify_A_reprocessed/captures/
 wheel_hole_insertion/stability_verify_A_reprocessed/detections/

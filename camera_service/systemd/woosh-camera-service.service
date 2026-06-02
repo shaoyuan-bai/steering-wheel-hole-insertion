@@ -1,0 +1,15 @@
+[Unit]
+Description=Woosh RealSense Camera Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/wooshrobot/bai/hand_eye_calibration
+ExecStart=/home/wooshrobot/miniconda3/envs/cyy/bin/python /home/wooshrobot/bai/hand_eye_calibration/camera_service/camera_service.py serve --host 0.0.0.0 --port 8099 --ws-port 8100 --open-on-start roles
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

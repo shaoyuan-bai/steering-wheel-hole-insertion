@@ -32,6 +32,10 @@ DEFAULT_MOBILE_TIMEOUT_S = float(cfg_get(CONFIG, "mobile_base", "timeout_s", def
 
 STEPS = [
     (
+        "vertical_pre_release",
+        "移动到垂直预释放姿态。建议方向盘保持接近竖直，便于后续底盘转向/前进时减少碰撞风险。",
+    ),
+    (
         "pre_place",
         "移动到桌面上方安全位。建议方向盘已经在桌面目标点正上方，离桌面/障碍物 80-150mm。",
     ),
@@ -133,6 +137,7 @@ def main():
         "mobile_base_url": args.mobile_base_url,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "notes": [
+            "vertical_pre_release: vertical pose before table release sequence.",
             "pre_place: safe pose above the table target.",
             "place: final release pose near/on table.",
             "retreat: safe pose after releasing and lifting away.",

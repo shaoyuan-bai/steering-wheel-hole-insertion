@@ -14,6 +14,12 @@ camera:
   fps: 30
   warmup: 30
 
+camera_service:
+  url: "http://127.0.0.1:8099"
+  ws_url: "ws://127.0.0.1:8100"
+  default_role: "right_arm"
+  timeout_s: 3.0
+
 hand_eye:
   # Updated from eye_hand_data/data20260601.
   valid: true
@@ -85,6 +91,26 @@ recording:
 mobile_base:
   base_url: "http://192.168.2.228:5001"
   timeout_s: 30.0
+  stop_timeout_s: 0.8
+  stop_requests:
+    - endpoint: "/stop"
+      payload: {}
+    - endpoint: "/emergency_stop"
+      payload: {}
+    - endpoint: "/chassis_stop"
+      payload: {}
+    - endpoint: "/base_stop"
+      payload: {}
+    - endpoint: "/lift_stop"
+      payload: {}
+    - endpoint: "/step_forward"
+      payload:
+        distance: 0.0
+        speed: 0.0
+    - endpoint: "/step_rotate"
+      payload:
+        angle: 0.0
+        speed: 0.0
 
 placement:
   poses_file: "table_place_poses.json"
@@ -116,12 +142,23 @@ post_insert_sequence:
   settle_s: 1.0
   movej_speed: 30
   max_current_to_pre_m: 1.20
+  max_current_to_vertical_m: 1.20
+  max_current_to_release_m: 1.20
+  onload_lift_after_vertical_exec_mode: 1
+  onload_lift_after_vertical_height_m: 0.80
+  onload_rotate_after_vertical_deg: 90.0
+  onload_forward_before_release_height_m: 0.30
+  onload_forward_avoid: 1
+  onload_release_lift_exec_mode: 1
+  onload_release_lift_height_m: 0.66
 
 post_insert_return_sequence:
-  lift_height_m: -0.01
-  backward_distance_m: -1.00
-  rotate_angle_deg: 90.0
-  forward_distance_m: 0.20
+  lift_exec_mode: 1
+  lift_height_m: 0.70
+  backward_distance_m: -0.30
+  rotate_angle_deg: -90.0
+  forward_distance_m: 0.30
   lift_speed: 0.03
   base_speed: 0.10
   rotate_speed: 0.20
+  initial_movej_speed: 100

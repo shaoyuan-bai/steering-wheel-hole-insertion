@@ -78,14 +78,17 @@ def set_right_gripper_modbus(robot_ip, robot_port, position, force, speed, devic
         time.sleep(0.8)
 
 
-def load_pre_place(path):
+def load_place_poses(path):
     path = Path(path).expanduser().resolve()
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     pre = data.get("poses", {}).get("pre_place")
     if not pre or "joint_deg" not in pre or "pose" not in pre:
         raise RuntimeError(f"{path} missing poses.pre_place.pose/joint_deg")
-    return path, pre
+    vertical = data.get("poses", {}).get("vertical_pre_release")
+    if vertical and ("joint_deg" not in vertical or "pose" not in vertical):
+        raise RuntimeError(f"{path} has invalid poses.vertical_pre_release; expected pose/joint_deg")
+    return path, vertical, pre
 
 
 def read_current_pose(robot_ip, robot_port):
@@ -137,11 +140,18 @@ def query_lift_state(args, label):
         return None
 
 
-def print_plan(current_pose, pre, args):
+def print_plan(current_pose, vertical, pre, args):
     pre_pose = pre["pose"]
     print("\n" + "=" * 72)
     print(f"script: {SCRIPT_VERSION}")
     print(f"current pose: {[round(float(x), 5) for x in current_pose]}")
+    if vertical is not None:
+        vertical_pose = vertical["pose"]
+        print(f"vertical_pre_release pose: {[round(float(x), 5) for x in vertical_pose]}")
+        print(f"current -> vertical_pre_release: {distance_m(current_pose, vertical_pose) * 1000.0:.1f} mm")
+        print(f"vertical_pre_release -> pre_place: {distance_m(vertical_pose, pre_pose) * 1000.0:.1f} mm")
+    else:
+        print("vertical_pre_release pose: not found, skipped")
     print(f"pre_place pose: {[round(float(x), 5) for x in pre_pose]}")
     print(f"current -> pre_place: {distance_m(current_pose, pre_pose) * 1000.0:.1f} mm")
     print(f"move arm to pre_place: {not args.skip_arm_move}")
@@ -204,13 +214,14 @@ def parse_args():
 
 def main():
     args = parse_args()
-    poses_path, pre = load_pre_place(args.poses)
+    poses_path, vertical, pre = load_place_poses(args.poses)
     current_pose, _ = read_current_pose(args.robot_ip, args.robot_port)
     print(f"[POSES] loaded: {poses_path}")
-    print_plan(current_pose, pre, args)
-    if not args.skip_arm_move and distance_m(current_pose, pre["pose"]) > float(args.max_current_to_pre_m):
+    print_plan(current_pose, vertical, pre, args)
+    safety_target = vertical if vertical is not None else pre
+    if not args.skip_arm_move and distance_m(current_pose, safety_target["pose"]) > float(args.max_current_to_pre_m):
         raise RuntimeError(
-            f"current->pre_place {distance_m(current_pose, pre['pose']) * 1000.0:.1f} mm exceeds "
+            f"current->{safety_target['name']} {distance_m(current_pose, safety_target['pose']) * 1000.0:.1f} mm exceeds "
             f"{args.max_current_to_pre_m * 1000.0:.1f} mm"
         )
     if not args.execute:
@@ -223,16 +234,26 @@ def main():
         if not args.skip_arm_move:
             mover = Rm65SafeIkMover(robot_ip=args.robot_ip, robot_port=args.robot_port, speed=args.movej_speed)
             mover.connect()
-            print("[1/4] movej to pre_place")
+            step_label = "vertical_pre_release" if vertical is not None else "pre_place"
+            print(f"[1/5] movej to {step_label}")
             ok = run_motion_with_keyboard_stop(
-                "lift-place-pre",
-                lambda: movej_recorded(mover, pre["joint_deg"], args.movej_speed) == 0,
+                f"lift-place-{step_label}",
+                lambda: movej_recorded(mover, (vertical or pre)["joint_deg"], args.movej_speed) == 0,
                 args,
             )
             if not ok:
-                raise RuntimeError("movej to pre_place failed.")
+                raise RuntimeError(f"movej to {step_label} failed.")
+            if vertical is not None:
+                print("[2/5] movej to pre_place")
+                ok = run_motion_with_keyboard_stop(
+                    "lift-place-pre",
+                    lambda: movej_recorded(mover, pre["joint_deg"], args.movej_speed) == 0,
+                    args,
+                )
+                if not ok:
+                    raise RuntimeError("movej to pre_place failed.")
         else:
-            print("[1/4] arm move skipped")
+            print("[1/5] arm move skipped")
 
         if args.pre_place_only:
             query_lift_state(args, "pre_place_only")
@@ -240,14 +261,14 @@ def main():
             return
 
         query_lift_state(args, "before_lower")
-        print("[2/4] lower lift")
+        print("[3/5] lower lift")
         lift_move(args, args.lift_lower_height_m, "lower")
         query_lift_state(args, "after_lower")
         time.sleep(max(0.0, float(args.settle_s)))
 
         if args.gripper_action != "none":
             position = args.gripper_open_position if args.gripper_action == "open" else args.gripper_close_position
-            print(f"[3/4] {args.gripper_action} gripper, position={position}")
+            print(f"[4/5] {args.gripper_action} gripper, position={position}")
             set_right_gripper_modbus(
                 robot_ip=args.robot_ip,
                 robot_port=args.robot_port,
@@ -258,10 +279,10 @@ def main():
                 timeout_s=args.gripper_timeout_s,
             )
         else:
-            print("[3/4] gripper action skipped")
+            print("[4/5] gripper action skipped")
         time.sleep(max(0.0, float(args.settle_s)))
 
-        print("[4/4] raise lift")
+        print("[5/5] raise lift")
         lift_move(args, args.lift_raise_height_m, "raise")
         query_lift_state(args, "after_raise")
         print("[OK] lift-based table placement complete")

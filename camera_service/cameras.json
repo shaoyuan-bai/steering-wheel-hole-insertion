@@ -1,0 +1,31 @@
+{
+  "roles": {
+    "right_arm": {
+      "serial": "405622075930",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "warmup": 30
+    },
+    "head": {
+      "serial": "250122076328",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "warmup": 30
+    },
+    "left_arm": {
+      "serial": "244222070594",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "warmup": 30
+    }
+  },
+  "defaults": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "warmup": 30
+  }
+}

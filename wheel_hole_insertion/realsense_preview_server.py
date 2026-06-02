@@ -2,6 +2,7 @@
 """LAN-accessible RealSense preview server for SSH-only operation."""
 
 import argparse
+import base64
 import json
 import socket
 import subprocess
@@ -14,7 +15,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import pyrealsense2 as rs
+import websocket
 from flask import Flask, Response, jsonify, render_template_string, request
 
 if str(SCRIPT_DIR := Path(__file__).resolve().parent) not in sys.path:
@@ -61,8 +62,9 @@ def post_external_json(url, payload, timeout_s=5.0):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
+        with opener.open(req, timeout=float(timeout_s)) as resp:
             body = resp.read().decode("utf-8", "ignore")
             try:
                 parsed = json.loads(body) if body else {}
@@ -72,6 +74,17 @@ def post_external_json(url, payload, timeout_s=5.0):
                 "status": int(resp.status),
                 "body": parsed,
             }
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "ignore")
+        raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
+
+
+def get_external_json(url, timeout_s=5.0):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=float(timeout_s)) as resp:
+            body = resp.read().decode("utf-8", "ignore")
+            return json.loads(body) if body else {}
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "ignore")
         raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
@@ -201,7 +214,7 @@ PAGE = """<!doctype html>
         <button onclick="runNormalAlignPreinsert()">法向对齐姿态</button>
         <button onclick="runLastPlanPreinsert()">按计划预插入</button>
         <button class="success" onclick="runLastPlanInsert()">插入 10mm</button>
-        <button class="success" onclick="runAutoAlignInsertOpen()">自动对齐插入</button>
+        <button class="success" onclick="runAutoAlignInsertOpen()">抓取方向盘上料</button>
       </div>
     </div>
     <aside>
@@ -224,7 +237,7 @@ PAGE = """<!doctype html>
           <button onclick="runRollSearchPreinsert()">保持姿态预插入</button>
           <button onclick="runNormalAlignPreinsert()">法向对齐姿态</button>
           <button onclick="runLastPlanPreinsert()">按计划预插入</button>
-          <button class="success" onclick="runAutoAlignInsertOpen()">自动对齐插入</button>
+          <button class="success" onclick="runAutoAlignInsertOpen()">抓取方向盘上料</button>
           <button class="success" onclick="runPostInsertPlace()">插入后放置流程</button>
           <button class="warn" onclick="runPostInsertReturn()">原路返回</button>
         </div>
@@ -389,7 +402,7 @@ PAGE = """<!doctype html>
       document.getElementById('robot').textContent = s.message || s.error || '';
     }
     async function runAutoAlignInsertOpen() {
-      if (!confirm(`确认执行自动对齐插入流程？将依次执行：法向对齐姿态、按计划预插入、4次插入10mm、打开夹爪、升降机上升0.02m、底盘后退0.3m。MoveJ速度=${speedPayload().movej_speed}，插入速度=${speedPayload().frontend_insert_speed}`)) return;
+      if (!confirm(`确认执行抓取方向盘上料？将依次执行：闭合夹爪、法向对齐姿态、按计划预插入、4次插入10mm、打开夹爪、升降机上升0.02m、底盘后退0.3m、机械臂到垂直预释放姿态、升降机上升到0.8、底盘旋转90°、机械臂到释放姿势、底盘前进0.3m并关闭避障、升降机高度到0.66。MoveJ速度=${speedPayload().movej_speed}，插入速度=${speedPayload().frontend_insert_speed}`)) return;
       const s = await postJson('/robot/auto_align_insert_open', speedPayload());
       document.getElementById('robot').textContent = s.message || s.error || '';
     }
@@ -493,50 +506,104 @@ class RealSenseStreamer:
         self._thread.start()
 
     def _run(self):
-        pipeline = rs.pipeline()
-        config = rs.config()
-        if self.args.serial:
-            config.enable_device(self.args.serial)
-        config.enable_stream(rs.stream.color, self.args.width, self.args.height, rs.format.bgr8, self.args.fps)
-        config.enable_stream(rs.stream.depth, self.args.width, self.args.height, rs.format.z16, self.args.fps)
-        profile = pipeline.start(config)
-        align = rs.align(rs.stream.color)
-        self._pipeline = pipeline
-        depth_scale = float(profile.get_device().first_depth_sensor().get_depth_scale())
-        color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
-        color_intrinsics = intrinsics_to_dict(color_stream.get_intrinsics())
-        with self.lock:
-            self.depth_scale = depth_scale
-            self.color_intrinsics = color_intrinsics
-        last_t = time.time()
+        service_url = self.args.camera_service_url.rstrip("/")
+        ws_url = self.args.camera_service_ws_url.rstrip("/")
+        role = self.args.camera_role
         try:
-            for _ in range(max(0, int(self.args.warmup))):
-                pipeline.wait_for_frames()
+            post_external_json(
+                f"{service_url}/camera/start",
+                {"role": role},
+                timeout_s=self.args.camera_service_timeout_s,
+            )
+        except Exception as exc:
+            with self.lock:
+                self.last_frame_time = f"camera service error: {exc}"
+        with self.lock:
+            self.depth_scale = None
+            self.color_intrinsics = None
+            self.depth_m = None
+        last_t = time.time()
+        interval = max(0.02, 1.0 / max(float(self.args.fps), 1.0))
+
+        def update_from_color(color, color_intrinsics=None, frame_time=None):
+            nonlocal last_t
+            now = time.time()
+            dt = max(now - last_t, 1e-6)
+            last_t = now
+            with self.lock:
+                self.color = color
+                self.depth_m = None
+                if color_intrinsics is not None:
+                    self.color_intrinsics = color_intrinsics
+                self.actual_fps = 0.9 * self.actual_fps + 0.1 * (1.0 / dt) if self.actual_fps else 1.0 / dt
+                self.last_frame_time = frame_time or time.strftime("%H:%M:%S")
+                yolo_enabled = self.yolo_enabled
+                yolo_due = now - self.yolo_last_time >= float(self.args.yolo_interval)
+            if yolo_enabled and yolo_due:
+                self._update_yolo(color, now)
+
+        def poll_http_once():
+            latest = get_external_json(
+                f"{service_url}/camera/latest/{role}?quality={int(self.args.jpeg_quality)}&image=1",
+                timeout_s=self.args.camera_service_timeout_s,
+            )
+            frame = latest.get("frame", {})
+            jpeg_b64 = frame.get("jpeg_base64")
+            if not jpeg_b64:
+                raise RuntimeError("camera service returned no jpeg_base64")
+            arr = np.frombuffer(base64.b64decode(jpeg_b64), dtype=np.uint8)
+            color = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if color is None:
+                raise RuntimeError("failed to decode camera service JPEG")
+            update_from_color(color, frame.get("color_intrinsics"), frame.get("last_frame_time"))
+
+        def run_websocket_loop():
+            url = f"{ws_url}/camera/ws/{role}?quality={int(self.args.jpeg_quality)}&fps={int(self.args.fps)}"
+            ws = websocket.create_connection(
+                url,
+                timeout=float(self.args.camera_service_timeout_s),
+                http_proxy_host=None,
+                http_proxy_port=None,
+                http_no_proxy=["127.0.0.1", "localhost", "*"],
+            )
+            try:
+                while self.running:
+                    msg = ws.recv()
+                    if isinstance(msg, str):
+                        try:
+                            payload = json.loads(msg)
+                        except json.JSONDecodeError:
+                            payload = {}
+                        if payload.get("type") == "error":
+                            raise RuntimeError(payload.get("error", "camera websocket error"))
+                        continue
+                    arr = np.frombuffer(msg, dtype=np.uint8)
+                    color = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if color is None:
+                        continue
+                    update_from_color(color)
+            finally:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+        try:
             while self.running:
-                frames = pipeline.wait_for_frames()
-                aligned = align.process(frames)
-                color_frame = aligned.get_color_frame()
-                depth_frame = aligned.get_depth_frame()
-                if not color_frame:
-                    continue
-                color = np.asanyarray(color_frame.get_data()).copy()
-                depth_m = None
-                if depth_frame:
-                    depth_m = np.asanyarray(depth_frame.get_data()).astype(np.float32) * depth_scale
-                now = time.time()
-                dt = max(now - last_t, 1e-6)
-                last_t = now
-                with self.lock:
-                    self.color = color
-                    self.depth_m = depth_m
-                    self.actual_fps = 0.9 * self.actual_fps + 0.1 * (1.0 / dt) if self.actual_fps else 1.0 / dt
-                    self.last_frame_time = time.strftime("%H:%M:%S")
-                    yolo_enabled = self.yolo_enabled
-                    yolo_due = now - self.yolo_last_time >= float(self.args.yolo_interval)
-                if yolo_enabled and yolo_due:
-                    self._update_yolo(color, now)
+                try:
+                    if self.args.disable_camera_websocket:
+                        poll_http_once()
+                        time.sleep(interval)
+                    else:
+                        run_websocket_loop()
+                except Exception as exc:
+                    with self.lock:
+                        self.last_frame_time = f"camera service error: {exc}"
+                    try:
+                        poll_http_once()
+                    except Exception:
+                        time.sleep(0.5)
         finally:
-            pipeline.stop()
             self.running = False
 
     def _load_yolo_net(self):
@@ -694,34 +761,24 @@ class RealSenseStreamer:
         return color, intr, frame_time
 
     def save_current_capture(self, root):
-        with self.lock:
-            if self.color is None or self.depth_m is None or self.color_intrinsics is None:
-                return None
-            color = self.color.copy()
-            depth_m = self.depth_m.copy()
-            color_intrinsics = dict(self.color_intrinsics)
-            depth_scale = self.depth_scale
-        out_dir = Path(root).expanduser().resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(out_dir / "color.png"), color)
-        np.save(str(out_dir / "depth_raw.npy"), depth_m)
-        depth_mm = np.rint(depth_m * 1000.0).astype(np.uint16)
-        cv2.imwrite(str(out_dir / "depth_mm.png"), depth_mm)
-        meta = {
-            "capture_time": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "source": "realsense_preview_server",
-            "depth_scale_m_per_unit": float(depth_scale) if depth_scale is not None else None,
-            "streams_aligned_to": "color",
-            "color_intrinsics": color_intrinsics,
-            "files": {
-                "color": "color.png",
-                "depth_raw_m": "depth_raw.npy",
-                "depth_mm": "depth_mm.png",
-            },
-        }
-        with open(out_dir / "intrinsics.json", "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2, ensure_ascii=False)
-        return out_dir
+        root = Path(root).expanduser().resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        service_url = self.args.camera_service_url.rstrip("/")
+        response = post_external_json(
+            f"{service_url}/camera/capture",
+            {"role": self.args.camera_role, "target_dir": str(root)},
+            timeout_s=max(5.0, float(self.args.camera_service_timeout_s)),
+        )
+        capture_dir = Path(response["body"].get("capture_dir", "")).expanduser().resolve()
+        if not capture_dir.exists():
+            return None
+        if capture_dir != root:
+            for name in ("color.png", "depth_raw.npy", "depth_mm.png", "depth_colormap.png", "depth_overlay.png", "intrinsics.json"):
+                src = capture_dir / name
+                dst = root / name
+                if src.exists():
+                    dst.write_bytes(src.read_bytes())
+        return root
 
     def status(self):
         with self.lock:
@@ -734,6 +791,9 @@ class RealSenseStreamer:
                 "depth_ready": self.depth_m is not None,
                 "actual_fps": float(self.actual_fps),
                 "last_frame_time": self.last_frame_time,
+                "source": "camera_service",
+                "camera_role": self.args.camera_role,
+                "camera_transport": "http" if self.args.disable_camera_websocket else "websocket",
                 "yolo_enabled": bool(self.yolo_enabled),
                 "yolo_found": bool(yolo_result and yolo_result.get("center") is not None),
                 "yolo_score": yolo_result.get("score"),
@@ -940,6 +1000,11 @@ def parse_args():
     parser.add_argument("--height", type=int, default=int(cfg_get(CONFIG, "camera", "height", default=720)))
     parser.add_argument("--fps", type=int, default=int(cfg_get(CONFIG, "camera", "fps", default=30)))
     parser.add_argument("--warmup", type=int, default=int(cfg_get(CONFIG, "camera", "warmup", default=15)))
+    parser.add_argument("--camera-service-url", default=str(cfg_get(CONFIG, "camera_service", "url", default="http://127.0.0.1:8099")))
+    parser.add_argument("--camera-service-ws-url", default=str(cfg_get(CONFIG, "camera_service", "ws_url", default="ws://127.0.0.1:8100")))
+    parser.add_argument("--camera-role", default=str(cfg_get(CONFIG, "camera_service", "default_role", default="right_arm")))
+    parser.add_argument("--camera-service-timeout-s", type=float, default=float(cfg_get(CONFIG, "camera_service", "timeout_s", default=3.0)))
+    parser.add_argument("--disable-camera-websocket", action="store_true")
     parser.add_argument("--jpeg-quality", type=int, default=85)
     parser.add_argument("--snapshot-dir", default=str(relative_path(CONFIG, "paths", "snapshot_dir", default="preview_snapshots")))
     parser.add_argument("--frontend-run-dir", default=str(relative_path(CONFIG, "paths", "frontend_run_dir", default="frontend_runs")))
@@ -980,6 +1045,7 @@ def parse_args():
     parser.add_argument("--recording-robot-timeout-s", type=float, default=float(cfg_get(CONFIG, "recording", "robot_timeout_s", default=1.0)))
     parser.add_argument("--mobile-base-url", default=str(cfg_get(CONFIG, "mobile_base", "base_url", default="http://192.168.2.228:5001")))
     parser.add_argument("--mobile-timeout-s", type=float, default=float(cfg_get(CONFIG, "mobile_base", "timeout_s", default=5.0)))
+    parser.add_argument("--mobile-stop-timeout-s", type=float, default=float(cfg_get(CONFIG, "mobile_base", "stop_timeout_s", default=0.8)))
     parser.add_argument("--post-insert-poses", default=str(relative_path(CONFIG, "post_insert_sequence", "poses_file", default="table_place_poses.json")))
     return parser.parse_args()
 
@@ -991,6 +1057,58 @@ def main():
     recorder = EpisodeRecorder(streamer, args)
     robot_lock = threading.Lock()
     robot_state = {"busy": False, "message": "", "last_plan": ""}
+    emergency_event = threading.Event()
+
+    def clear_emergency_for_new_motion():
+        emergency_event.clear()
+
+    def assert_not_emergency(label=""):
+        if emergency_event.is_set():
+            suffix = f" at {label}" if label else ""
+            raise RuntimeError(f"emergency stop requested{suffix}")
+
+    def configured_mobile_stop_requests():
+        runtime_config = load_config()
+        requests_cfg = cfg_get(runtime_config, "mobile_base", "stop_requests", default=[]) or []
+        cleaned = []
+        for item in requests_cfg:
+            if not isinstance(item, dict):
+                continue
+            endpoint = str(item.get("endpoint", "")).strip()
+            if not endpoint:
+                continue
+            if not endpoint.startswith("/"):
+                endpoint = "/" + endpoint
+            payload = item.get("payload", {})
+            if not isinstance(payload, dict):
+                payload = {}
+            cleaned.append((endpoint, payload))
+        return cleaned
+
+    def send_arm_stop_now():
+        mover = Rm65SafeIkMover(robot_ip=args.robot_ip, robot_port=args.robot_port, speed=1)
+        try:
+            mover.connect()
+            ret = mover.arm.rm_set_arm_stop()
+            return f"arm_stop ret={ret}"
+        finally:
+            try:
+                mover.close()
+            except Exception:
+                pass
+
+    def send_mobile_stop_now():
+        results = []
+        for endpoint, payload in configured_mobile_stop_requests():
+            url = args.mobile_base_url.rstrip("/") + endpoint
+            try:
+                result = post_external_json(url, payload, timeout_s=args.mobile_stop_timeout_s)
+                results.append(f"{endpoint}: ok {result}")
+            except Exception as exc:
+                results.append(f"{endpoint}: {exc}")
+        if not results:
+            results.append("no mobile stop_requests configured")
+        return results
 
     app = Flask(__name__)
 
@@ -1051,6 +1169,7 @@ def main():
         with robot_lock:
             if robot_state["busy"]:
                 return jsonify({"ok": False, "error": "robot command already running"}), 409
+            clear_emergency_for_new_motion()
             robot_state["busy"] = True
             robot_state["message"] = f"moving to initial pose, speed={speed_config['initial_movej_speed']}"
 
@@ -1082,30 +1201,43 @@ def main():
     @app.route("/robot/stop", methods=["POST"])
     def robot_stop():
         def worker():
-            mover = Rm65SafeIkMover(robot_ip=args.robot_ip, robot_port=args.robot_port, speed=1)
-            try:
-                mover.connect()
-                ret = mover.arm.rm_set_arm_stop()
-                msg = f"stop ret={ret}"
-            except Exception as exc:
-                msg = f"stop error: {exc}"
-            finally:
-                try:
-                    mover.close()
-                finally:
-                    with robot_lock:
-                        robot_state["busy"] = False
-                        robot_state["message"] = msg
+            results = []
 
+            def run_stop(label, fn):
+                try:
+                    value = fn()
+                    if isinstance(value, list):
+                        results.extend([f"{label}: {x}" for x in value])
+                    else:
+                        results.append(f"{label}: {value}")
+                except Exception as exc:
+                    results.append(f"{label}: error {exc}")
+
+            threads = [
+                threading.Thread(target=run_stop, args=("arm", send_arm_stop_now), daemon=True),
+                threading.Thread(target=run_stop, args=("mobile", send_mobile_stop_now), daemon=True),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=max(0.2, float(args.mobile_stop_timeout_s) + 0.5))
+            msg = "EMERGENCY STOP sent: " + " | ".join(results)
+            with robot_lock:
+                robot_state["busy"] = False
+                robot_state["message"] = msg
+
+        emergency_event.set()
         with robot_lock:
-            robot_state["message"] = "stopping"
+            robot_state["busy"] = False
+            robot_state["message"] = "EMERGENCY STOP requested: stopping arm/mobile"
         threading.Thread(target=worker, daemon=True).start()
-        return jsonify({"ok": True, "message": "stop command sent"})
+        return jsonify({"ok": True, "message": "EMERGENCY STOP command sent"})
 
     def start_gripper_action(action_name, position):
         with robot_lock:
             if robot_state["busy"]:
                 return jsonify({"ok": False, "error": "robot command already running"}), 409
+            clear_emergency_for_new_motion()
             robot_state["busy"] = True
             robot_state["message"] = f"gripper {action_name} running"
 
@@ -1144,6 +1276,7 @@ def main():
         with robot_lock:
             if robot_state["busy"]:
                 return jsonify({"ok": False, "error": "robot command already running"}), 409
+            clear_emergency_for_new_motion()
             robot_state["busy"] = True
             robot_state["message"] = f"{action_name} running: {payload}"
 
@@ -1189,16 +1322,23 @@ def main():
         }
         return mobile_post("/step_rotate", clean, "step_rotate")
 
-    def load_post_insert_pre_place():
+    def load_post_insert_place_poses():
         path = Path(args.post_insert_poses).expanduser().resolve()
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         pre = data.get("poses", {}).get("pre_place")
         if not pre or "joint_deg" not in pre or "pose" not in pre:
             raise RuntimeError(f"{path} missing poses.pre_place.pose/joint_deg")
-        return path, pre
+        vertical = data.get("poses", {}).get("vertical_pre_release")
+        if vertical and ("joint_deg" not in vertical or "pose" not in vertical):
+            raise RuntimeError(f"{path} has invalid poses.vertical_pre_release; expected pose/joint_deg")
+        release = data.get("poses", {}).get("place")
+        if not release or "joint_deg" not in release or "pose" not in release:
+            raise RuntimeError(f"{path} missing poses.place.pose/joint_deg")
+        return path, vertical, pre, release
 
     def mobile_post_sync(endpoint, payload, label):
+        assert_not_emergency(label)
         url = args.mobile_base_url.rstrip("/") + endpoint
         print(f"[POST-INSERT] {label}: POST {url} {payload}")
         result = post_external_json(url, payload, timeout_s=args.mobile_timeout_s)
@@ -1212,13 +1352,23 @@ def main():
             label,
         )
 
+    def post_insert_lift_command(exec_mode, height, speed, label):
+        return mobile_post_sync(
+            "/lift_control3",
+            {"execMode": int(exec_mode), "speed": float(speed), "height": float(height)},
+            label,
+        )
+
     def post_insert_lift_query(label):
         return mobile_post_sync("/lift_control3", {"execMode": 0}, label)
 
-    def post_insert_step_forward(distance, speed, label):
+    def post_insert_step_forward(distance, speed, label, avoid=None):
+        payload = {"distance": float(distance), "speed": float(speed)}
+        if avoid is not None:
+            payload["avoid"] = int(avoid)
         return mobile_post_sync(
             "/step_forward",
-            {"distance": float(distance), "speed": float(speed)},
+            payload,
             label,
         )
 
@@ -1235,6 +1385,7 @@ def main():
         with robot_lock:
             if robot_state["busy"]:
                 return jsonify({"ok": False, "error": "robot command already running"}), 409
+            clear_emergency_for_new_motion()
             robot_state["busy"] = True
             robot_state["message"] = "post-insert place sequence starting"
 
@@ -1256,31 +1407,37 @@ def main():
                 movej_speed = int(seq.get("movej_speed", speed_config["movej_speed"]))
                 max_current_to_pre = float(seq.get("max_current_to_pre_m", 1.20))
 
-                poses_path, pre = load_post_insert_pre_place()
-                print(f"[POST-INSERT] loaded pre_place: {poses_path}")
+                poses_path, vertical, pre, _ = load_post_insert_place_poses()
+                print(f"[POST-INSERT] loaded place poses: {poses_path}")
                 steps = [
                     "1 lift +0.01",
                     "2 base backward",
                     "3 base rotate",
-                    "4 arm to pre_place",
-                    "5 base forward",
-                    "6 lift lower",
-                    "7 close gripper",
-                    "8 lift raise",
+                    "4 arm to vertical_pre_release",
+                    "5 arm to pre_place",
+                    "6 base forward",
+                    "7 lift lower",
+                    "8 close gripper",
+                    "9 lift raise",
                 ]
+                if vertical is None:
+                    steps[3] = "4 vertical_pre_release missing, skip"
                 print(f"[POST-INSERT] steps: {steps}")
 
+                assert_not_emergency("post-insert lift up")
                 with robot_lock:
-                    robot_state["message"] = "post-insert 1/8 lift up"
-                post_insert_lift(first_lift, lift_speed, "1/8 lift_up")
+                    robot_state["message"] = "post-insert 1/9 lift up"
+                post_insert_lift(first_lift, lift_speed, "1/9 lift_up")
 
+                assert_not_emergency("post-insert base backward")
                 with robot_lock:
-                    robot_state["message"] = "post-insert 2/8 base backward"
-                post_insert_step_forward(backward, base_speed, "2/8 base_backward")
+                    robot_state["message"] = "post-insert 2/9 base backward"
+                post_insert_step_forward(backward, base_speed, "2/9 base_backward")
 
+                assert_not_emergency("post-insert base rotate")
                 with robot_lock:
-                    robot_state["message"] = "post-insert 3/8 base rotate"
-                post_insert_step_rotate(np.deg2rad(rotate_deg), rotate_speed, "3/8 base_rotate")
+                    robot_state["message"] = "post-insert 3/9 base rotate"
+                post_insert_step_rotate(np.deg2rad(rotate_deg), rotate_speed, "3/9 base_rotate")
 
                 current_pose = None
                 try:
@@ -1295,15 +1452,17 @@ def main():
                     except Exception:
                         pass
                 if current_pose is not None:
-                    dist = float(np.linalg.norm(np.asarray(current_pose[:3]) - np.asarray(pre["pose"][:3])))
+                    safety_target = vertical if vertical is not None else pre
+                    dist = float(np.linalg.norm(np.asarray(current_pose[:3]) - np.asarray(safety_target["pose"][:3])))
                     if dist > max_current_to_pre:
                         raise RuntimeError(
-                            f"current->pre_place {dist * 1000.0:.1f} mm exceeds "
+                            f"current->{safety_target['name']} {dist * 1000.0:.1f} mm exceeds "
                             f"{max_current_to_pre * 1000.0:.1f} mm"
                         )
 
+                assert_not_emergency("post-insert vertical_pre_release")
                 with robot_lock:
-                    robot_state["message"] = "post-insert 4/8 arm to pre_place"
+                    robot_state["message"] = "post-insert 4/9 arm to vertical_pre_release"
                 mover = Rm65SafeIkMover(
                     robot_ip=args.robot_ip,
                     robot_port=args.robot_port,
@@ -1312,25 +1471,40 @@ def main():
                     max_j6_step_deg=120,
                 )
                 mover.connect()
+                if vertical is not None:
+                    ret = mover.movej([float(x) for x in vertical["joint_deg"][:6]])
+                    print(f"[POST-INSERT] 4/9 movej vertical_pre_release ret={ret}")
+                    if ret != 0:
+                        raise RuntimeError(f"movej vertical_pre_release failed, ret={ret}")
+                else:
+                    print("[POST-INSERT] 4/9 vertical_pre_release missing, skipped")
+
+                assert_not_emergency("post-insert pre_place")
+                with robot_lock:
+                    robot_state["message"] = "post-insert 5/9 arm to pre_place"
                 ret = mover.movej([float(x) for x in pre["joint_deg"][:6]])
-                print(f"[POST-INSERT] 4/8 movej pre_place ret={ret}")
+                print(f"[POST-INSERT] 5/9 movej pre_place ret={ret}")
                 if ret != 0:
                     raise RuntimeError(f"movej pre_place failed, ret={ret}")
 
+                assert_not_emergency("post-insert base forward")
                 with robot_lock:
-                    robot_state["message"] = "post-insert 5/8 base forward"
-                post_insert_step_forward(forward, base_speed, "5/8 base_forward")
+                    robot_state["message"] = "post-insert 6/9 base forward"
+                post_insert_step_forward(forward, base_speed, "6/9 base_forward")
 
+                assert_not_emergency("post-insert lift query")
                 with robot_lock:
                     robot_state["message"] = "post-insert query lift pre-place"
                 post_insert_lift_query("pre_place_lift_state")
 
+                assert_not_emergency("post-insert lift lower")
                 with robot_lock:
-                    robot_state["message"] = "post-insert 6/8 lift lower"
-                post_insert_lift(lower, lift_speed, "6/8 lift_lower")
+                    robot_state["message"] = "post-insert 7/9 lift lower"
+                post_insert_lift(lower, lift_speed, "7/9 lift_lower")
 
+                assert_not_emergency("post-insert close gripper")
                 with robot_lock:
-                    robot_state["message"] = "post-insert 7/8 close gripper"
+                    robot_state["message"] = "post-insert 8/9 close gripper"
                 set_right_gripper_modbus(
                     robot_ip=args.robot_ip,
                     robot_port=args.robot_port,
@@ -1342,9 +1516,10 @@ def main():
                 )
                 time.sleep(max(0.0, settle_s))
 
+                assert_not_emergency("post-insert lift raise")
                 with robot_lock:
-                    robot_state["message"] = "post-insert 8/8 lift raise"
-                post_insert_lift(raise_h, lift_speed, "8/8 lift_raise")
+                    robot_state["message"] = "post-insert 9/9 lift raise"
+                post_insert_lift(raise_h, lift_speed, "9/9 lift_raise")
                 msg = "post-insert place sequence complete"
             except Exception as exc:
                 msg = f"post-insert place sequence error: {exc}"
@@ -1366,6 +1541,7 @@ def main():
         with robot_lock:
             if robot_state["busy"]:
                 return jsonify({"ok": False, "error": "robot command already running"}), 409
+            clear_emergency_for_new_motion()
             robot_state["busy"] = True
             robot_state["message"] = "post-insert return sequence starting"
 
@@ -1373,37 +1549,68 @@ def main():
             try:
                 runtime_config = load_config()
                 seq = cfg_get(runtime_config, "post_insert_return_sequence", default={}) or {}
-                lift_h = float(seq.get("lift_height_m", -0.01))
-                backward = float(seq.get("backward_distance_m", -1.00))
-                rotate_deg = float(seq.get("rotate_angle_deg", 90.0))
-                forward = float(seq.get("forward_distance_m", 0.20))
+                lift_exec_mode = int(seq.get("lift_exec_mode", 1))
+                lift_h = float(seq.get("lift_height_m", 0.70))
+                backward = float(seq.get("backward_distance_m", -0.30))
+                rotate_deg = float(seq.get("rotate_angle_deg", -90.0))
+                forward = float(seq.get("forward_distance_m", 0.30))
                 lift_speed = float(seq.get("lift_speed", 0.03))
                 base_speed = float(seq.get("base_speed", 0.10))
                 rotate_speed = float(seq.get("rotate_speed", 0.20))
+                initial_movej_speed = int(seq.get("initial_movej_speed", args.initial_movej_speed))
 
                 steps = [
-                    "1 lift return",
+                    "1 lift to return height",
                     "2 base backward",
-                    "3 base rotate back",
-                    "4 base forward",
+                    "3 arm to initial",
+                    "4 base rotate",
+                    "5 base forward",
                 ]
                 print(f"[POST-RETURN] steps: {steps}")
 
+                assert_not_emergency("post-return lift")
                 with robot_lock:
-                    robot_state["message"] = "post-return 1/4 lift return"
-                post_insert_lift(lift_h, lift_speed, "return 1/4 lift")
+                    robot_state["message"] = f"post-return 1/5 lift to {lift_h:.3f}"
+                post_insert_lift_command(lift_exec_mode, lift_h, lift_speed, "return 1/5 lift_to_height")
 
+                assert_not_emergency("post-return base backward")
                 with robot_lock:
-                    robot_state["message"] = "post-return 2/4 base backward"
-                post_insert_step_forward(backward, base_speed, "return 2/4 base_backward")
+                    robot_state["message"] = "post-return 2/5 base backward"
+                post_insert_step_forward(backward, base_speed, "return 2/5 base_backward")
 
+                assert_not_emergency("post-return arm initial")
                 with robot_lock:
-                    robot_state["message"] = "post-return 3/4 base rotate"
-                post_insert_step_rotate(np.deg2rad(rotate_deg), rotate_speed, "return 3/4 base_rotate")
+                    robot_state["message"] = f"post-return 3/5 arm to initial, speed={initial_movej_speed}"
+                if not INITIAL_JOINT_DEG:
+                    raise RuntimeError("robot.initial_joint_deg is empty in config.yaml")
+                mover = Rm65SafeIkMover(
+                    robot_ip=args.robot_ip,
+                    robot_port=args.robot_port,
+                    speed=initial_movej_speed,
+                    max_joint_step_deg=180,
+                    max_j6_step_deg=180,
+                )
+                try:
+                    mover.connect()
+                    ret = mover.movej(INITIAL_JOINT_DEG)
+                    print(f"[POST-RETURN] 3/5 movej initial ret={ret}")
+                    if ret != 0:
+                        raise RuntimeError(f"movej initial failed, ret={ret}")
+                finally:
+                    try:
+                        mover.close()
+                    except Exception:
+                        pass
 
+                assert_not_emergency("post-return base rotate")
                 with robot_lock:
-                    robot_state["message"] = "post-return 4/4 base forward"
-                post_insert_step_forward(forward, base_speed, "return 4/4 base_forward")
+                    robot_state["message"] = f"post-return 4/5 base rotate {rotate_deg:.1f}deg"
+                post_insert_step_rotate(np.deg2rad(rotate_deg), rotate_speed, "return 4/5 base_rotate")
+
+                assert_not_emergency("post-return base forward")
+                with robot_lock:
+                    robot_state["message"] = "post-return 5/5 base forward"
+                post_insert_step_forward(forward, base_speed, "return 5/5 base_forward")
 
                 msg = "post-insert return sequence complete"
             except Exception as exc:
@@ -1421,6 +1628,7 @@ def main():
         with robot_lock:
             if robot_state["busy"]:
                 return jsonify({"ok": False, "error": "robot command already running"}), 409
+            clear_emergency_for_new_motion()
             robot_state["busy"] = True
             robot_state["message"] = f"{mode} preinsert running, movej_speed={speed_config['movej_speed']}"
             robot_state["last_plan"] = ""
@@ -1561,6 +1769,7 @@ def main():
             if not Path(plan_path).exists():
                 robot_state["last_plan"] = ""
                 return jsonify({"ok": False, "error": f"current plan missing: {plan_path}"}), 404
+            clear_emergency_for_new_motion()
             robot_state["busy"] = True
             robot_state["message"] = f"last-plan preinsert running, movej_speed={speed_config['movej_speed']}: {plan_path}"
 
@@ -1601,6 +1810,7 @@ def main():
             if not Path(plan_path).exists():
                 robot_state["last_plan"] = ""
                 return jsonify({"ok": False, "error": f"current plan missing: {plan_path}"}), 404
+            clear_emergency_for_new_motion()
             robot_state["busy"] = True
             robot_state["message"] = f"insert running, speed={speed_config['frontend_insert_speed']}: {plan_path}"
 
@@ -1636,12 +1846,14 @@ def main():
         with robot_lock:
             if robot_state["busy"]:
                 return jsonify({"ok": False, "error": "robot command already running"}), 409
+            clear_emergency_for_new_motion()
             robot_state["busy"] = True
-            robot_state["message"] = "auto flow starting: normal align -> preinsert -> 4x insert -> open gripper -> lift up -> base back"
+            robot_state["message"] = "抓取方向盘上料 starting: close -> align -> preinsert -> insert -> open -> lift/back -> vertical -> lift/rotate -> release -> forward -> lift height"
             robot_state["last_plan"] = ""
 
         def worker():
             plan_json = None
+            mover = None
             try:
                 ts = time.strftime("%Y%m%d_%H%M%S")
                 run_root = Path(args.frontend_run_dir).expanduser().resolve() / f"frontend_{ts}_auto_align_insert_open"
@@ -1661,10 +1873,35 @@ def main():
                 post_seq = cfg_get(runtime_config, "post_insert_sequence", default={}) or {}
                 lift_speed = float(post_seq.get("lift_speed", 0.03))
                 base_speed = float(post_seq.get("base_speed", 0.10))
+                rotate_speed = float(post_seq.get("rotate_speed", 0.20))
+                movej_speed = int(post_seq.get("movej_speed", speed_config["movej_speed"]))
+                max_current_to_vertical = float(post_seq.get("max_current_to_vertical_m", post_seq.get("max_current_to_pre_m", 1.20)))
+                max_current_to_release = float(post_seq.get("max_current_to_release_m", post_seq.get("max_current_to_pre_m", 1.20)))
+                onload_lift_after_vertical_exec_mode = int(post_seq.get("onload_lift_after_vertical_exec_mode", 1))
+                onload_lift_after_vertical_height = float(post_seq.get("onload_lift_after_vertical_height_m", 0.80))
+                onload_rotate_after_vertical_deg = float(post_seq.get("onload_rotate_after_vertical_deg", 90.0))
+                onload_forward_before_release_height = float(post_seq.get("onload_forward_before_release_height_m", 0.30))
+                onload_forward_avoid = int(post_seq.get("onload_forward_avoid", 1))
+                onload_release_lift_exec_mode = int(post_seq.get("onload_release_lift_exec_mode", 1))
+                onload_release_lift_height = float(post_seq.get("onload_release_lift_height_m", 0.66))
                 tip_tcp_arg = format_vec3_arg(tip_tcp_m)
 
+                assert_not_emergency("auto close gripper")
                 with robot_lock:
-                    robot_state["message"] = "auto 1/10 capture RGBD and detect center hole"
+                    robot_state["message"] = "抓取方向盘上料 1/17 close gripper"
+                set_right_gripper_modbus(
+                    robot_ip=args.robot_ip,
+                    robot_port=args.robot_port,
+                    position=int(args.gripper_close_position),
+                    force=int(args.gripper_force),
+                    speed=int(args.gripper_speed),
+                    device_id=int(args.gripper_device_id),
+                    timeout_s=int(args.gripper_timeout_s),
+                )
+
+                assert_not_emergency("auto capture")
+                with robot_lock:
+                    robot_state["message"] = "抓取方向盘上料 2/17 capture RGBD and detect center hole"
                 saved_capture = streamer.save_current_capture(capture_dir)
                 if saved_capture is None:
                     raise RuntimeError("no RGBD frame ready")
@@ -1683,14 +1920,16 @@ def main():
                 ]
                 subprocess.run(detect_cmd, check=True)
 
+                assert_not_emergency("auto detection quality check")
                 with open(detection_json, "r", encoding="utf-8") as f:
                     detection_payload = json.load(f)
                 if detection_payload.get("quality") != "ok":
                     reasons = ", ".join(detection_payload.get("quality_reasons", [])) or "unknown"
                     raise RuntimeError(f"detection quality={detection_payload.get('quality')}: {reasons}")
 
+                assert_not_emergency("auto align orientation")
                 with robot_lock:
-                    robot_state["message"] = "auto 2/10 align orientation to normal"
+                    robot_state["message"] = "抓取方向盘上料 3/17 align orientation to normal"
                 align_cmd = [
                     sys.executable,
                     str(SCRIPT_DIR / "move_to_center_hole.py"),
@@ -1715,9 +1954,10 @@ def main():
                 print("[AUTO ALIGN CMD]", " ".join(str(x) for x in align_cmd))
                 subprocess.run(align_cmd, check=True)
 
+                assert_not_emergency("auto planned preinsert")
                 with robot_lock:
                     robot_state["last_plan"] = str(plan_json)
-                    robot_state["message"] = "auto 3/10 move to planned preinsert"
+                    robot_state["message"] = "抓取方向盘上料 4/17 move to planned preinsert"
                 preinsert_cmd = [
                     sys.executable,
                     str(SCRIPT_DIR / "move_to_center_hole.py"),
@@ -1732,8 +1972,9 @@ def main():
                 subprocess.run(preinsert_cmd, check=True)
 
                 for idx in range(4):
+                    assert_not_emergency(f"auto insert step {idx + 1}")
                     with robot_lock:
-                        robot_state["message"] = f"auto {idx + 4}/10 insert 10mm step {idx + 1}/4"
+                        robot_state["message"] = f"抓取方向盘上料 {idx + 5}/17 insert 10mm step {idx + 1}/4"
                     insert_cmd = [
                         sys.executable,
                         str(SCRIPT_DIR / "continue_insert_along_axis.py"),
@@ -1750,8 +1991,9 @@ def main():
                     if idx < 3:
                         time.sleep(1.0)
 
+                assert_not_emergency("auto open gripper")
                 with robot_lock:
-                    robot_state["message"] = "auto 8/10 open gripper"
+                    robot_state["message"] = "抓取方向盘上料 9/17 open gripper"
                 set_right_gripper_modbus(
                     robot_ip=args.robot_ip,
                     robot_port=args.robot_port,
@@ -1762,18 +2004,131 @@ def main():
                     timeout_s=int(args.gripper_timeout_s),
                 )
 
+                assert_not_emergency("auto lift up")
                 with robot_lock:
-                    robot_state["message"] = "auto 9/10 lift up 0.02m"
-                post_insert_lift(0.02, lift_speed, "auto 9/10 lift_up")
+                    robot_state["message"] = "抓取方向盘上料 10/17 lift up 0.02m"
+                post_insert_lift(0.02, lift_speed, "抓取方向盘上料 10/17 lift_up")
 
+                assert_not_emergency("auto base backward")
                 with robot_lock:
-                    robot_state["message"] = "auto 10/10 base backward -0.3m"
-                post_insert_step_forward(-0.3, base_speed, "auto 10/10 base_backward")
+                    robot_state["message"] = "抓取方向盘上料 11/17 base backward -0.3m"
+                post_insert_step_forward(-0.3, base_speed, "抓取方向盘上料 11/17 base_backward")
 
-                msg = f"auto align-insert-open-lift-back complete: {run_root}"
+                assert_not_emergency("auto load vertical_pre_release")
+                poses_path, vertical, _, release = load_post_insert_place_poses()
+                if vertical is None:
+                    raise RuntimeError(f"{poses_path} missing poses.vertical_pre_release")
+                current_pose = None
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.connect((args.robot_ip, int(args.robot_port)))
+                    state = get_current_state(sock)
+                    if state:
+                        current_pose, _ = state
+                finally:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                if current_pose is not None:
+                    dist = float(np.linalg.norm(np.asarray(current_pose[:3]) - np.asarray(vertical["pose"][:3])))
+                    if dist > max_current_to_vertical:
+                        raise RuntimeError(
+                            f"current->vertical_pre_release {dist * 1000.0:.1f} mm exceeds "
+                            f"{max_current_to_vertical * 1000.0:.1f} mm"
+                        )
+
+                assert_not_emergency("auto vertical_pre_release")
+                with robot_lock:
+                    robot_state["message"] = "抓取方向盘上料 12/17 arm to vertical_pre_release"
+                mover = Rm65SafeIkMover(
+                    robot_ip=args.robot_ip,
+                    robot_port=args.robot_port,
+                    speed=movej_speed,
+                    max_joint_step_deg=120,
+                    max_j6_step_deg=120,
+                )
+                mover.connect()
+                ret = mover.movej([float(x) for x in vertical["joint_deg"][:6]])
+                print(f"[AUTO] 12/17 movej vertical_pre_release ret={ret}, poses={poses_path}")
+                if ret != 0:
+                    raise RuntimeError(f"movej vertical_pre_release failed, ret={ret}")
+
+                assert_not_emergency("auto lift after vertical_pre_release")
+                with robot_lock:
+                    robot_state["message"] = f"抓取方向盘上料 13/17 lift height to {onload_lift_after_vertical_height:.3f}"
+                post_insert_lift_command(
+                    onload_lift_after_vertical_exec_mode,
+                    onload_lift_after_vertical_height,
+                    lift_speed,
+                    "抓取方向盘上料 13/17 lift_after_vertical_to_height",
+                )
+
+                assert_not_emergency("auto base rotate after vertical_pre_release")
+                with robot_lock:
+                    robot_state["message"] = f"抓取方向盘上料 14/17 base rotate {onload_rotate_after_vertical_deg:.1f}deg"
+                post_insert_step_rotate(
+                    np.deg2rad(onload_rotate_after_vertical_deg),
+                    rotate_speed,
+                    "抓取方向盘上料 14/17 base_rotate_after_vertical",
+                )
+
+                assert_not_emergency("auto release pose")
+                current_pose = None
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.connect((args.robot_ip, int(args.robot_port)))
+                    state = get_current_state(sock)
+                    if state:
+                        current_pose, _ = state
+                finally:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                if current_pose is not None:
+                    dist = float(np.linalg.norm(np.asarray(current_pose[:3]) - np.asarray(release["pose"][:3])))
+                    if dist > max_current_to_release:
+                        raise RuntimeError(
+                            f"current->release {dist * 1000.0:.1f} mm exceeds "
+                            f"{max_current_to_release * 1000.0:.1f} mm"
+                        )
+                with robot_lock:
+                    robot_state["message"] = "抓取方向盘上料 15/17 arm to release pose"
+                ret = mover.movej([float(x) for x in release["joint_deg"][:6]])
+                print(f"[AUTO] 15/17 movej release ret={ret}, poses={poses_path}")
+                if ret != 0:
+                    raise RuntimeError(f"movej release pose failed, ret={ret}")
+
+                assert_not_emergency("auto base forward before release height")
+                with robot_lock:
+                    robot_state["message"] = f"抓取方向盘上料 16/17 base forward {onload_forward_before_release_height:.3f}m avoid={onload_forward_avoid}"
+                post_insert_step_forward(
+                    onload_forward_before_release_height,
+                    base_speed,
+                    "抓取方向盘上料 16/17 base_forward_before_release_height",
+                    avoid=onload_forward_avoid,
+                )
+
+                assert_not_emergency("auto lift to release height")
+                with robot_lock:
+                    robot_state["message"] = f"抓取方向盘上料 17/17 lift height to {onload_release_lift_height:.3f}"
+                post_insert_lift_command(
+                    onload_release_lift_exec_mode,
+                    onload_release_lift_height,
+                    lift_speed,
+                    "抓取方向盘上料 17/17 lift_to_release_height",
+                )
+
+                msg = f"抓取方向盘上料 complete: {run_root}"
             except Exception as exc:
-                msg = f"auto align-insert-open-lift-back error: {exc}"
+                msg = f"抓取方向盘上料 error: {exc}"
             finally:
+                if mover is not None:
+                    try:
+                        mover.close()
+                    except Exception:
+                        pass
                 with robot_lock:
                     robot_state["busy"] = False
                     robot_state["message"] = msg
@@ -1781,7 +2136,7 @@ def main():
                         robot_state["last_plan"] = str(plan_json)
 
         threading.Thread(target=worker, daemon=True).start()
-        return jsonify({"ok": True, "message": "auto align-insert-open started"})
+        return jsonify({"ok": True, "message": "抓取方向盘上料 started"})
 
     @app.route("/robot/status")
     def robot_status():

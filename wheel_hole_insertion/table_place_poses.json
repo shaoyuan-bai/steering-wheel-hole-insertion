@@ -1,0 +1,96 @@
+{
+  "script_version": "2026-06-01-table-place-teach-v1",
+  "robot_ip": "169.254.128.21",
+  "robot_port": 8080,
+  "created_at": "2026-06-01 17:14:51",
+  "notes": [
+    "vertical_pre_release: vertical pose before table release sequence.",
+    "pre_place: safe pose above the table target.",
+    "place: final release pose near/on table.",
+    "retreat: safe pose after releasing and lifting away."
+  ],
+  "poses": {
+    "pre_place": {
+      "name": "pre_place",
+      "pose": [
+        -0.015171,
+        -0.437854,
+        0.047053,
+        2.782,
+        -0.679,
+        -2.597
+      ],
+      "joint_deg": [
+        102.301,
+        87.838,
+        26.262,
+        -42.864,
+        80.366,
+        -88.437
+      ],
+      "captured_at": "2026-06-01 17:12:10"
+    },
+    "place": {
+      "name": "place",
+      "description": "Final release pose near/on table; used as the steering wheel release posture.",
+      "pose": [
+        -0.2698,
+        -0.428816,
+        0.157049,
+        2.604,
+        -0.619,
+        -2.325
+      ],
+      "joint_deg": [
+        70.084,
+        74.944,
+        25.257,
+        -46.062,
+        67.955,
+        -133.043
+      ],
+      "captured_at": "2026-06-02 16:19:50"
+    },
+    "retreat": {
+      "name": "retreat",
+      "pose": [
+        -0.13993,
+        -0.381987,
+        -0.060727,
+        2.629,
+        -0.612,
+        -2.417
+      ],
+      "joint_deg": [
+        86.003,
+        95.468,
+        44.953,
+        -57.642,
+        56.059,
+        -85.083
+      ],
+      "captured_at": "2026-06-01 17:14:51"
+    },
+    "vertical_pre_release": {
+      "name": "vertical_pre_release",
+      "description": "Vertical pre-release pose after grasp retreat; used before releasing the steering wheel.",
+      "pose": [
+        -0.381445,
+        0.081481,
+        0.186165,
+        2.627,
+        -0.634,
+        -2.412
+      ],
+      "joint_deg": [
+        -16.265,
+        32.64,
+        105.684,
+        -74.459,
+        -10.618,
+        -149.773
+      ],
+      "captured_at": "2026-06-02 15:41:22"
+    }
+  }
+}

@@ -4,6 +4,8 @@
 import argparse
 import json
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import cv2
@@ -18,6 +20,24 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from config_loader import CONFIG, cfg_get, relative_path  # noqa: E402
+
+
+def post_json(url, payload, timeout_s=5.0):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(req, timeout=float(timeout_s)) as resp:
+            body = resp.read().decode("utf-8", "ignore")
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "ignore")
+        raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
 
 
 def intrinsics_to_dict(intr):
@@ -61,7 +81,35 @@ def main():
     parser.add_argument("--fps", type=int, default=int(cfg_get(CONFIG, "camera", "fps", default=30)))
     parser.add_argument("--warmup", type=int, default=int(cfg_get(CONFIG, "camera", "warmup", default=30)))
     parser.add_argument("--alpha", type=float, default=0.55)
+    parser.add_argument("--camera-service-url", default=str(cfg_get(CONFIG, "camera_service", "url", default="http://127.0.0.1:8099")))
+    parser.add_argument("--camera-role", default=str(cfg_get(CONFIG, "camera_service", "default_role", default="right_arm")))
+    parser.add_argument("--camera-service-timeout-s", type=float, default=float(cfg_get(CONFIG, "camera_service", "timeout_s", default=5.0)))
+    parser.add_argument("--direct-realsense", action="store_true",
+                        help="Bypass camera_service and open RealSense directly. Use only for debugging.")
     args = parser.parse_args()
+
+    if not args.direct_realsense:
+        out_root = Path(args.out).expanduser().resolve()
+        out_root.mkdir(parents=True, exist_ok=True)
+        response = post_json(
+            args.camera_service_url.rstrip("/") + "/camera/capture",
+            {
+                "role": args.camera_role,
+                "out": str(out_root),
+                "width": args.width,
+                "height": args.height,
+                "fps": args.fps,
+                "warmup": args.warmup,
+            },
+            timeout_s=max(5.0, float(args.camera_service_timeout_s)),
+        )
+        capture_dir = response.get("capture_dir", "")
+        if not capture_dir and isinstance(response.get("body"), dict):
+            capture_dir = response["body"].get("capture_dir", "")
+        if not capture_dir:
+            raise RuntimeError(f"camera_service did not return capture_dir: {response}")
+        print(Path(capture_dir).expanduser().resolve())
+        return
 
     devices = list_realsense_devices()
     if not devices:
