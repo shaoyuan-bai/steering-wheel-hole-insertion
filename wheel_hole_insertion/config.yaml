@@ -49,6 +49,8 @@ insertion:
   offset_frame: "camera"
   observed_right_offset_m: -0.0050
   observed_up_offset_m: 0.0080
+  plan_preinsert_extra_right_m: 0.000
+  plan_preinsert_extra_up_m: 0.003
   preinsert_distance_m: 0.040
   insert_depth_m: 0.002
   frontend_insert_distance_m: 0.010
@@ -118,7 +120,7 @@ placement:
   descend_speed: 5
   retreat_speed: 10
   lift_exec_mode: 2
-  lift_speed: 0.03
+  lift_speed: 1.00
   # Sign depends on lift API convention. Test with dry-run and a small value first.
   lift_lower_height_m: -0.10
   lift_raise_height_m: 0.10
@@ -136,9 +138,9 @@ post_insert_sequence:
   forward_distance_m: 1.00
   place_lift_lower_height_m: -0.10
   place_lift_raise_height_m: 0.10
-  lift_speed: 0.03
-  base_speed: 0.10
-  rotate_speed: 0.20
+  lift_speed: 1.00
+  base_speed: 1.00
+  rotate_speed: 1.00
   settle_s: 1.0
   movej_speed: 30
   max_current_to_pre_m: 1.20
@@ -158,7 +160,7 @@ post_insert_return_sequence:
   backward_distance_m: -0.30
   rotate_angle_deg: -90.0
   forward_distance_m: 0.30
-  lift_speed: 0.03
-  base_speed: 0.10
-  rotate_speed: 0.20
+  lift_speed: 1.00
+  base_speed: 1.00
+  rotate_speed: 1.00
   initial_movej_speed: 100

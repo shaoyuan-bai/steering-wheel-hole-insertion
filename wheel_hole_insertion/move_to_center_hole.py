@@ -201,6 +201,36 @@ def build_plan(pose_now, detection, args):
     )
 
 
+def apply_plan_execution_offset(plan, args):
+    """Apply direct right/up execution offsets to a loaded --plan-in plan."""
+    right_m = float(getattr(args, "plan_preinsert_extra_right_m", 0.0))
+    up_m = float(getattr(args, "plan_preinsert_extra_up_m", 0.0))
+    if abs(right_m) < 1e-9 and abs(up_m) < 1e-9:
+        return plan
+
+    view_right = np.asarray(plan.get("view_right_base", []), dtype=np.float64)
+    view_up = np.asarray(plan.get("view_up_base", []), dtype=np.float64)
+    if view_right.shape != (3,) or view_up.shape != (3,):
+        raise RuntimeError("Loaded plan has no view_right_base/view_up_base; cannot apply extra plan offset.")
+    view_right = normalize(view_right, "plan_view_right_base")
+    view_up = normalize(view_up, "plan_view_up_base")
+    correction = view_right * right_m + view_up * up_m
+
+    adjusted = dict(plan)
+    for key in ("center_base_m", "pre_tip_base_m", "final_tip_base_m"):
+        if key in adjusted:
+            adjusted[key] = (np.asarray(adjusted[key], dtype=np.float64) + correction).tolist()
+    for key in ("preinsert_pose", "final_pose"):
+        pose = [float(x) for x in adjusted[key]]
+        pose[:3] = [float(round(v, 3)) for v in (np.asarray(pose[:3], dtype=np.float64) + correction)]
+        adjusted[key] = pose
+
+    adjusted["plan_execution_extra_right_m"] = right_m
+    adjusted["plan_execution_extra_up_m"] = up_m
+    adjusted["plan_execution_extra_correction_base_m"] = correction.tolist()
+    return adjusted
+
+
 def parse_vec3(text, name):
     parts = [p.strip() for p in str(text).replace(",", " ").split() if p.strip()]
     if len(parts) != 3:
@@ -226,6 +256,16 @@ def print_plan(detection_path, pose_now, joint_now, plan):
     print(f"insert_axis_base: {[round(float(x), 5) for x in plan['insert_axis_base']]}")
     if any(abs(float(x)) > 1e-9 for x in plan.get("visual_correction_base_m", [0.0, 0.0, 0.0])):
         print(f"visual_correction_base_m: {[round(float(x), 5) for x in plan['visual_correction_base_m']]}")
+    if any(abs(float(x)) > 1e-9 for x in plan.get("plan_execution_extra_correction_base_m", [0.0, 0.0, 0.0])):
+        print(
+            "plan_execution_extra_right/up_m: "
+            f"{float(plan.get('plan_execution_extra_right_m', 0.0)):.4f}/"
+            f"{float(plan.get('plan_execution_extra_up_m', 0.0)):.4f}"
+        )
+        print(
+            "plan_execution_extra_correction_base_m: "
+            f"{[round(float(x), 5) for x in plan['plan_execution_extra_correction_base_m']]}"
+        )
     print(f"preinsert_pose: {[round(float(x), 5) for x in plan['preinsert_pose']]}")
     print(f"final_pose: {[round(float(x), 5) for x in plan['final_pose']]}")
     print(f"preinsert move: {plan['preinsert_move_m'] * 1000.0:.1f} mm")
@@ -519,6 +559,12 @@ def parse_args():
                         help="Observed rod offset above the hole, from robot-to-hole view. Target is compensated down.")
     parser.add_argument("--offset-frame", choices=["camera", "base"], default=cfg_get(CONFIG, "insertion", "offset_frame", default="camera"),
                         help="Frame used by observed right/up offsets. camera means image right/up projected to the hole plane.")
+    parser.add_argument("--plan-preinsert-extra-right-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "plan_preinsert_extra_right_m", default=0.0)),
+                        help="Direct extra right offset applied when executing --plan-in, in the saved plan view plane.")
+    parser.add_argument("--plan-preinsert-extra-up-m", type=float,
+                        default=float(cfg_get(CONFIG, "insertion", "plan_preinsert_extra_up_m", default=0.0)),
+                        help="Direct extra up offset applied when executing --plan-in, in the saved plan view plane.")
     parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
     parser.add_argument("--robot-port", type=int, default=DEFAULT_ROBOT_PORT)
     parser.add_argument("--tool-axis", default=cfg_get(CONFIG, "tool", "tool_axis", default="+z"),
@@ -599,6 +645,7 @@ def main():
 
         if args.plan_in:
             detection_path, plan = load_plan(args.plan_in)
+            plan = apply_plan_execution_offset(plan, args)
             print_plan(detection_path, pose_now, joint_now, plan)
         elif args.base_center or args.base_normal:
             if not args.base_center or not args.base_normal:

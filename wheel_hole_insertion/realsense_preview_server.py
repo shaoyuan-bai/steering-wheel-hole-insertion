@@ -31,27 +31,70 @@ from rm65_sdk_safe_ik import Rm65SafeIkMover  # noqa: E402
 
 INITIAL_JOINT_DEG = [float(x) for x in cfg_get(CONFIG, "robot", "initial_joint_deg", default=[])]
 DEFAULT_MODEL = relative_path(CONFIG, "detection", "model", default="label_dataset/best.onnx")
+GRIPPER_INIT_LOCK = threading.Lock()
+GRIPPER_INITIALIZED = False
 
 
-def set_right_gripper_modbus(robot_ip, robot_port, position, force, speed, device_id, timeout_s):
+def _send_gripper_commands(robot_ip, robot_port, commands, timeout_s, per_command_delay_s=0.12, final_delay_s=0.0):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as gripper_sock:
+        gripper_sock.settimeout(max(1, int(timeout_s)))
+        gripper_sock.connect((robot_ip, int(robot_port)))
+        time.sleep(0.1)
+        for command in commands:
+            gripper_sock.sendall(command.encode("utf-8"))
+            time.sleep(float(per_command_delay_s))
+        if final_delay_s > 0:
+            time.sleep(float(final_delay_s))
+
+
+def init_right_gripper_modbus(robot_ip, robot_port, device_id, timeout_s, force=None, speed=None):
     commands = [
         '{"command":"set_tool_voltage","voltage_type":3}\r\n',
         '{"command":"set_modbus_mode","port":1,"baudrate":115200,"timeout ":2}\r\n',
         '{"command":"write_registers","port":1,"address":1000,"num":1,"data":[0,0], "device":%d}\r\n' % device_id,
         '{"command":"write_registers","port":1,"address":1000,"num":1,"data":[0,1], "device":%d}\r\n' % device_id,
+    ]
+    if force is not None and speed is not None:
+        commands.append(
+            '{"command":"write_registers","port":1,"address":1002,"num":1,"data":[%d,%d], "device":%d}\r\n'
+            % (int(force), int(speed), device_id)
+        )
+    _send_gripper_commands(robot_ip, robot_port, commands, timeout_s, per_command_delay_s=0.25, final_delay_s=0.5)
+
+
+def ensure_right_gripper_initialized(robot_ip, robot_port, device_id, timeout_s, force=None, speed=None):
+    global GRIPPER_INITIALIZED
+    if GRIPPER_INITIALIZED:
+        return
+    with GRIPPER_INIT_LOCK:
+        if GRIPPER_INITIALIZED:
+            return
+        init_right_gripper_modbus(
+            robot_ip=robot_ip,
+            robot_port=robot_port,
+            device_id=device_id,
+            timeout_s=timeout_s,
+            force=force,
+            speed=speed,
+        )
+        GRIPPER_INITIALIZED = True
+
+
+def set_right_gripper_modbus(robot_ip, robot_port, position, force, speed, device_id, timeout_s):
+    ensure_right_gripper_initialized(
+        robot_ip=robot_ip,
+        robot_port=robot_port,
+        device_id=device_id,
+        timeout_s=timeout_s,
+        force=force,
+        speed=speed,
+    )
+    commands = [
         '{"command":"write_registers","port":1,"address":1002,"num":1,"data":[%d,%d], "device":%d}\r\n' % (force, speed, device_id),
         '{"command":"write_registers","port":1,"address":1001,"num":1,"data":[%d,%d], "device":%d}\r\n' % (position, position, device_id),
         '{"command":"write_registers","port":1,"address":1000,"num":1,"data":[0,9], "device":%d}\r\n' % device_id,
     ]
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as gripper_sock:
-        gripper_sock.settimeout(max(1, int(timeout_s)))
-        gripper_sock.connect((robot_ip, int(robot_port)))
-        time.sleep(0.2)
-        for command in commands:
-            gripper_sock.sendall(command.encode("utf-8"))
-            time.sleep(0.25)
-        time.sleep(0.8)
+    _send_gripper_commands(robot_ip, robot_port, commands, timeout_s, per_command_delay_s=0.08, final_delay_s=0.2)
 
 
 def post_external_json(url, payload, timeout_s=5.0):
@@ -238,7 +281,6 @@ PAGE = """<!doctype html>
           <button onclick="runNormalAlignPreinsert()">法向对齐姿态</button>
           <button onclick="runLastPlanPreinsert()">按计划预插入</button>
           <button class="success" onclick="runAutoAlignInsertOpen()">抓取方向盘上料</button>
-          <button class="success" onclick="runPostInsertPlace()">插入后放置流程</button>
           <button class="warn" onclick="runPostInsertReturn()">原路返回</button>
         </div>
       </section>
@@ -283,7 +325,7 @@ PAGE = """<!doctype html>
           </div>
           <div class="speed-field">
             <label for="liftSpeed">升降速度</label>
-            <input id="liftSpeed" type="number" step="0.01" value="0.03">
+            <input id="liftSpeed" type="number" step="0.01" value="0.10">
           </div>
           <div class="speed-field">
             <label for="baseDistance">前后距离</label>
@@ -291,7 +333,7 @@ PAGE = """<!doctype html>
           </div>
           <div class="speed-field">
             <label for="baseSpeed">前后速度</label>
-            <input id="baseSpeed" type="number" step="0.01" value="0.1">
+            <input id="baseSpeed" type="number" step="0.01" value="1.0">
           </div>
           <div class="speed-field">
             <label for="rotateAngleDeg">旋转角度 deg</label>
@@ -299,7 +341,7 @@ PAGE = """<!doctype html>
           </div>
           <div class="speed-field">
             <label for="rotateSpeed">旋转速度</label>
-            <input id="rotateSpeed" type="number" step="0.01" value="0.2">
+            <input id="rotateSpeed" type="number" step="0.01" value="1.0">
           </div>
         </div>
         <div class="stack">
@@ -310,6 +352,9 @@ PAGE = """<!doctype html>
       </section>
       <section>
         <h2>机器人状态</h2>
+        <div class="rows">
+          <div class="row"><span class="k">当前 pose x,y,z,rx,ry,rz</span><span id="robotPose" class="v"></span></div>
+        </div>
         <div id="robot" class="robot-message"></div>
       </section>
     </aside>
@@ -361,6 +406,7 @@ PAGE = """<!doctype html>
         const rr = await fetch('/robot/status');
         const rs = await rr.json();
         document.getElementById('robot').textContent = rs.busy ? `执行中：${rs.message || ''}` : (rs.message || '空闲');
+        document.getElementById('robotPose').textContent = rs.pose ? `[${rs.pose.map(v => Number(v).toFixed(4)).join(', ')}]` : '';
       } catch (e) {
         document.getElementById('status').textContent = '离线';
         document.getElementById('status').className = 'pill warn';
@@ -402,13 +448,8 @@ PAGE = """<!doctype html>
       document.getElementById('robot').textContent = s.message || s.error || '';
     }
     async function runAutoAlignInsertOpen() {
-      if (!confirm(`确认执行抓取方向盘上料？将依次执行：闭合夹爪、法向对齐姿态、按计划预插入、4次插入10mm、打开夹爪、升降机上升0.02m、底盘后退0.3m、机械臂到垂直预释放姿态、升降机上升到0.8、底盘旋转90°、机械臂到释放姿势、底盘前进0.3m并关闭避障、升降机高度到0.66。MoveJ速度=${speedPayload().movej_speed}，插入速度=${speedPayload().frontend_insert_speed}`)) return;
+      if (!confirm(`确认执行抓取方向盘上料？将依次执行：闭合夹爪、法向对齐姿态、按计划预插入、5次插入10mm、打开夹爪、升降机上升0.02m、底盘后退0.3m、机械臂到垂直预释放姿态、升降机上升到0.8、底盘旋转90°、机械臂到释放姿势、底盘前进0.3m并关闭避障、升降机高度到0.66、闭合夹爪。MoveJ速度=${speedPayload().movej_speed}，插入速度=${speedPayload().frontend_insert_speed}`)) return;
       const s = await postJson('/robot/auto_align_insert_open', speedPayload());
-      document.getElementById('robot').textContent = s.message || s.error || '';
-    }
-    async function runPostInsertPlace() {
-      if (!confirm('确认执行插入后放置流程？将依次执行升降机抬升、底盘后退、旋转、前进、机械臂到下降姿态、升降机下降、闭合夹爪、升降机抬起。')) return;
-      const s = await postJson('/robot/post_insert_place_sequence', speedPayload());
       document.getElementById('robot').textContent = s.message || s.error || '';
     }
     async function runPostInsertReturn() {
@@ -445,7 +486,7 @@ PAGE = """<!doctype html>
     async function liftMove() {
       const payload = {
         execMode: 2,
-        speed: Number(document.getElementById('liftSpeed').value || 0.03),
+        speed: Number(document.getElementById('liftSpeed').value || 0.10),
         height: Number(document.getElementById('liftHeight').value || 0.05),
       };
       if (!confirm(`确认升降机移动？height=${payload.height}, speed=${payload.speed}`)) return;
@@ -455,7 +496,7 @@ PAGE = """<!doctype html>
     async function baseStepForward() {
       const payload = {
         distance: Number(document.getElementById('baseDistance').value || -2.5),
-        speed: Number(document.getElementById('baseSpeed').value || 0.1),
+        speed: Number(document.getElementById('baseSpeed').value || 1.0),
       };
       if (!confirm(`确认整体前后移动？distance=${payload.distance}, speed=${payload.speed}`)) return;
       const s = await postJson('/mobile/step_forward', payload);
@@ -465,7 +506,7 @@ PAGE = """<!doctype html>
       const angleDeg = Number(document.getElementById('rotateAngleDeg').value || -90);
       const payload = {
         angle: angleDeg * Math.PI / 180.0,
-        speed: Number(document.getElementById('rotateSpeed').value || 0.2),
+        speed: Number(document.getElementById('rotateSpeed').value || 1.0),
       };
       if (!confirm(`确认整体旋转？angle=${angleDeg}° (${payload.angle.toFixed(4)} rad), speed=${payload.speed}`)) return;
       const s = await postJson('/mobile/step_rotate', payload);
@@ -1379,163 +1420,6 @@ def main():
             label,
         )
 
-    @app.route("/robot/post_insert_place_sequence", methods=["POST"])
-    def post_insert_place_sequence():
-        speed_config = request_speed_config()
-        with robot_lock:
-            if robot_state["busy"]:
-                return jsonify({"ok": False, "error": "robot command already running"}), 409
-            clear_emergency_for_new_motion()
-            robot_state["busy"] = True
-            robot_state["message"] = "post-insert place sequence starting"
-
-        def worker():
-            mover = None
-            try:
-                runtime_config = load_config()
-                seq = cfg_get(runtime_config, "post_insert_sequence", default={}) or {}
-                first_lift = float(seq.get("first_lift_height_m", 0.01))
-                backward = float(seq.get("backward_distance_m", -0.20))
-                rotate_deg = float(seq.get("rotate_angle_deg", -90.0))
-                forward = float(seq.get("forward_distance_m", 1.00))
-                lower = float(seq.get("place_lift_lower_height_m", -0.10))
-                raise_h = float(seq.get("place_lift_raise_height_m", 0.10))
-                lift_speed = float(seq.get("lift_speed", 0.03))
-                base_speed = float(seq.get("base_speed", 0.10))
-                rotate_speed = float(seq.get("rotate_speed", 0.20))
-                settle_s = float(seq.get("settle_s", 1.0))
-                movej_speed = int(seq.get("movej_speed", speed_config["movej_speed"]))
-                max_current_to_pre = float(seq.get("max_current_to_pre_m", 1.20))
-
-                poses_path, vertical, pre, _ = load_post_insert_place_poses()
-                print(f"[POST-INSERT] loaded place poses: {poses_path}")
-                steps = [
-                    "1 lift +0.01",
-                    "2 base backward",
-                    "3 base rotate",
-                    "4 arm to vertical_pre_release",
-                    "5 arm to pre_place",
-                    "6 base forward",
-                    "7 lift lower",
-                    "8 close gripper",
-                    "9 lift raise",
-                ]
-                if vertical is None:
-                    steps[3] = "4 vertical_pre_release missing, skip"
-                print(f"[POST-INSERT] steps: {steps}")
-
-                assert_not_emergency("post-insert lift up")
-                with robot_lock:
-                    robot_state["message"] = "post-insert 1/9 lift up"
-                post_insert_lift(first_lift, lift_speed, "1/9 lift_up")
-
-                assert_not_emergency("post-insert base backward")
-                with robot_lock:
-                    robot_state["message"] = "post-insert 2/9 base backward"
-                post_insert_step_forward(backward, base_speed, "2/9 base_backward")
-
-                assert_not_emergency("post-insert base rotate")
-                with robot_lock:
-                    robot_state["message"] = "post-insert 3/9 base rotate"
-                post_insert_step_rotate(np.deg2rad(rotate_deg), rotate_speed, "3/9 base_rotate")
-
-                current_pose = None
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.connect((args.robot_ip, int(args.robot_port)))
-                    state = get_current_state(sock)
-                    if state:
-                        current_pose, _ = state
-                finally:
-                    try:
-                        sock.close()
-                    except Exception:
-                        pass
-                if current_pose is not None:
-                    safety_target = vertical if vertical is not None else pre
-                    dist = float(np.linalg.norm(np.asarray(current_pose[:3]) - np.asarray(safety_target["pose"][:3])))
-                    if dist > max_current_to_pre:
-                        raise RuntimeError(
-                            f"current->{safety_target['name']} {dist * 1000.0:.1f} mm exceeds "
-                            f"{max_current_to_pre * 1000.0:.1f} mm"
-                        )
-
-                assert_not_emergency("post-insert vertical_pre_release")
-                with robot_lock:
-                    robot_state["message"] = "post-insert 4/9 arm to vertical_pre_release"
-                mover = Rm65SafeIkMover(
-                    robot_ip=args.robot_ip,
-                    robot_port=args.robot_port,
-                    speed=movej_speed,
-                    max_joint_step_deg=120,
-                    max_j6_step_deg=120,
-                )
-                mover.connect()
-                if vertical is not None:
-                    ret = mover.movej([float(x) for x in vertical["joint_deg"][:6]])
-                    print(f"[POST-INSERT] 4/9 movej vertical_pre_release ret={ret}")
-                    if ret != 0:
-                        raise RuntimeError(f"movej vertical_pre_release failed, ret={ret}")
-                else:
-                    print("[POST-INSERT] 4/9 vertical_pre_release missing, skipped")
-
-                assert_not_emergency("post-insert pre_place")
-                with robot_lock:
-                    robot_state["message"] = "post-insert 5/9 arm to pre_place"
-                ret = mover.movej([float(x) for x in pre["joint_deg"][:6]])
-                print(f"[POST-INSERT] 5/9 movej pre_place ret={ret}")
-                if ret != 0:
-                    raise RuntimeError(f"movej pre_place failed, ret={ret}")
-
-                assert_not_emergency("post-insert base forward")
-                with robot_lock:
-                    robot_state["message"] = "post-insert 6/9 base forward"
-                post_insert_step_forward(forward, base_speed, "6/9 base_forward")
-
-                assert_not_emergency("post-insert lift query")
-                with robot_lock:
-                    robot_state["message"] = "post-insert query lift pre-place"
-                post_insert_lift_query("pre_place_lift_state")
-
-                assert_not_emergency("post-insert lift lower")
-                with robot_lock:
-                    robot_state["message"] = "post-insert 7/9 lift lower"
-                post_insert_lift(lower, lift_speed, "7/9 lift_lower")
-
-                assert_not_emergency("post-insert close gripper")
-                with robot_lock:
-                    robot_state["message"] = "post-insert 8/9 close gripper"
-                set_right_gripper_modbus(
-                    robot_ip=args.robot_ip,
-                    robot_port=args.robot_port,
-                    position=int(args.gripper_close_position),
-                    force=int(args.gripper_force),
-                    speed=int(args.gripper_speed),
-                    device_id=int(args.gripper_device_id),
-                    timeout_s=int(args.gripper_timeout_s),
-                )
-                time.sleep(max(0.0, settle_s))
-
-                assert_not_emergency("post-insert lift raise")
-                with robot_lock:
-                    robot_state["message"] = "post-insert 9/9 lift raise"
-                post_insert_lift(raise_h, lift_speed, "9/9 lift_raise")
-                msg = "post-insert place sequence complete"
-            except Exception as exc:
-                msg = f"post-insert place sequence error: {exc}"
-            finally:
-                if mover is not None:
-                    try:
-                        mover.close()
-                    except Exception:
-                        pass
-                with robot_lock:
-                    robot_state["busy"] = False
-                    robot_state["message"] = msg
-
-        threading.Thread(target=worker, daemon=True).start()
-        return jsonify({"ok": True, "message": "post-insert place sequence started"})
-
     @app.route("/robot/post_insert_return_sequence", methods=["POST"])
     def post_insert_return_sequence():
         with robot_lock:
@@ -1848,7 +1732,7 @@ def main():
                 return jsonify({"ok": False, "error": "robot command already running"}), 409
             clear_emergency_for_new_motion()
             robot_state["busy"] = True
-            robot_state["message"] = "抓取方向盘上料 starting: close -> align -> preinsert -> insert -> open -> lift/back -> vertical -> lift/rotate -> release -> forward -> lift height"
+            robot_state["message"] = "抓取方向盘上料 starting: close -> align -> preinsert -> insert -> open -> lift/back -> vertical -> lift/rotate -> release -> forward -> lift height -> close"
             robot_state["last_plan"] = ""
 
         def worker():
@@ -1888,7 +1772,7 @@ def main():
 
                 assert_not_emergency("auto close gripper")
                 with robot_lock:
-                    robot_state["message"] = "抓取方向盘上料 1/17 close gripper"
+                    robot_state["message"] = "抓取方向盘上料 1/19 close gripper"
                 set_right_gripper_modbus(
                     robot_ip=args.robot_ip,
                     robot_port=args.robot_port,
@@ -1901,7 +1785,7 @@ def main():
 
                 assert_not_emergency("auto capture")
                 with robot_lock:
-                    robot_state["message"] = "抓取方向盘上料 2/17 capture RGBD and detect center hole"
+                    robot_state["message"] = "抓取方向盘上料 2/19 capture RGBD and detect center hole"
                 saved_capture = streamer.save_current_capture(capture_dir)
                 if saved_capture is None:
                     raise RuntimeError("no RGBD frame ready")
@@ -1929,7 +1813,7 @@ def main():
 
                 assert_not_emergency("auto align orientation")
                 with robot_lock:
-                    robot_state["message"] = "抓取方向盘上料 3/17 align orientation to normal"
+                    robot_state["message"] = "抓取方向盘上料 3/19 align orientation to normal"
                 align_cmd = [
                     sys.executable,
                     str(SCRIPT_DIR / "move_to_center_hole.py"),
@@ -1957,7 +1841,7 @@ def main():
                 assert_not_emergency("auto planned preinsert")
                 with robot_lock:
                     robot_state["last_plan"] = str(plan_json)
-                    robot_state["message"] = "抓取方向盘上料 4/17 move to planned preinsert"
+                    robot_state["message"] = "抓取方向盘上料 4/19 move to planned preinsert"
                 preinsert_cmd = [
                     sys.executable,
                     str(SCRIPT_DIR / "move_to_center_hole.py"),
@@ -1971,10 +1855,10 @@ def main():
                 ]
                 subprocess.run(preinsert_cmd, check=True)
 
-                for idx in range(4):
+                for idx in range(5):
                     assert_not_emergency(f"auto insert step {idx + 1}")
                     with robot_lock:
-                        robot_state["message"] = f"抓取方向盘上料 {idx + 5}/17 insert 10mm step {idx + 1}/4"
+                        robot_state["message"] = f"抓取方向盘上料 {idx + 5}/19 insert 10mm step {idx + 1}/5"
                     insert_cmd = [
                         sys.executable,
                         str(SCRIPT_DIR / "continue_insert_along_axis.py"),
@@ -1988,12 +1872,12 @@ def main():
                         "--robot-port", str(args.robot_port),
                     ]
                     subprocess.run(insert_cmd, check=True)
-                    if idx < 3:
+                    if idx < 4:
                         time.sleep(1.0)
 
                 assert_not_emergency("auto open gripper")
                 with robot_lock:
-                    robot_state["message"] = "抓取方向盘上料 9/17 open gripper"
+                    robot_state["message"] = "抓取方向盘上料 10/19 open gripper"
                 set_right_gripper_modbus(
                     robot_ip=args.robot_ip,
                     robot_port=args.robot_port,
@@ -2006,13 +1890,13 @@ def main():
 
                 assert_not_emergency("auto lift up")
                 with robot_lock:
-                    robot_state["message"] = "抓取方向盘上料 10/17 lift up 0.02m"
-                post_insert_lift(0.02, lift_speed, "抓取方向盘上料 10/17 lift_up")
+                    robot_state["message"] = "抓取方向盘上料 11/19 lift up 0.02m"
+                post_insert_lift(0.02, lift_speed, "抓取方向盘上料 11/19 lift_up")
 
                 assert_not_emergency("auto base backward")
                 with robot_lock:
-                    robot_state["message"] = "抓取方向盘上料 11/17 base backward -0.3m"
-                post_insert_step_forward(-0.3, base_speed, "抓取方向盘上料 11/17 base_backward")
+                    robot_state["message"] = "抓取方向盘上料 12/19 base backward -0.3m"
+                post_insert_step_forward(-0.3, base_speed, "抓取方向盘上料 12/19 base_backward")
 
                 assert_not_emergency("auto load vertical_pre_release")
                 poses_path, vertical, _, release = load_post_insert_place_poses()
@@ -2040,7 +1924,7 @@ def main():
 
                 assert_not_emergency("auto vertical_pre_release")
                 with robot_lock:
-                    robot_state["message"] = "抓取方向盘上料 12/17 arm to vertical_pre_release"
+                    robot_state["message"] = "抓取方向盘上料 13/19 arm to vertical_pre_release"
                 mover = Rm65SafeIkMover(
                     robot_ip=args.robot_ip,
                     robot_port=args.robot_port,
@@ -2050,27 +1934,27 @@ def main():
                 )
                 mover.connect()
                 ret = mover.movej([float(x) for x in vertical["joint_deg"][:6]])
-                print(f"[AUTO] 12/17 movej vertical_pre_release ret={ret}, poses={poses_path}")
+                print(f"[AUTO] 13/19 movej vertical_pre_release ret={ret}, poses={poses_path}")
                 if ret != 0:
                     raise RuntimeError(f"movej vertical_pre_release failed, ret={ret}")
 
                 assert_not_emergency("auto lift after vertical_pre_release")
                 with robot_lock:
-                    robot_state["message"] = f"抓取方向盘上料 13/17 lift height to {onload_lift_after_vertical_height:.3f}"
+                    robot_state["message"] = f"抓取方向盘上料 14/19 lift height to {onload_lift_after_vertical_height:.3f}"
                 post_insert_lift_command(
                     onload_lift_after_vertical_exec_mode,
                     onload_lift_after_vertical_height,
                     lift_speed,
-                    "抓取方向盘上料 13/17 lift_after_vertical_to_height",
+                    "抓取方向盘上料 14/19 lift_after_vertical_to_height",
                 )
 
                 assert_not_emergency("auto base rotate after vertical_pre_release")
                 with robot_lock:
-                    robot_state["message"] = f"抓取方向盘上料 14/17 base rotate {onload_rotate_after_vertical_deg:.1f}deg"
+                    robot_state["message"] = f"抓取方向盘上料 15/19 base rotate {onload_rotate_after_vertical_deg:.1f}deg"
                 post_insert_step_rotate(
                     np.deg2rad(onload_rotate_after_vertical_deg),
                     rotate_speed,
-                    "抓取方向盘上料 14/17 base_rotate_after_vertical",
+                    "抓取方向盘上料 15/19 base_rotate_after_vertical",
                 )
 
                 assert_not_emergency("auto release pose")
@@ -2094,30 +1978,43 @@ def main():
                             f"{max_current_to_release * 1000.0:.1f} mm"
                         )
                 with robot_lock:
-                    robot_state["message"] = "抓取方向盘上料 15/17 arm to release pose"
+                    robot_state["message"] = "抓取方向盘上料 16/19 arm to release pose"
                 ret = mover.movej([float(x) for x in release["joint_deg"][:6]])
-                print(f"[AUTO] 15/17 movej release ret={ret}, poses={poses_path}")
+                print(f"[AUTO] 16/19 movej release ret={ret}, poses={poses_path}")
                 if ret != 0:
                     raise RuntimeError(f"movej release pose failed, ret={ret}")
 
                 assert_not_emergency("auto base forward before release height")
                 with robot_lock:
-                    robot_state["message"] = f"抓取方向盘上料 16/17 base forward {onload_forward_before_release_height:.3f}m avoid={onload_forward_avoid}"
+                    robot_state["message"] = f"抓取方向盘上料 17/19 base forward {onload_forward_before_release_height:.3f}m avoid={onload_forward_avoid}"
                 post_insert_step_forward(
                     onload_forward_before_release_height,
                     base_speed,
-                    "抓取方向盘上料 16/17 base_forward_before_release_height",
+                    "抓取方向盘上料 17/19 base_forward_before_release_height",
                     avoid=onload_forward_avoid,
                 )
 
                 assert_not_emergency("auto lift to release height")
                 with robot_lock:
-                    robot_state["message"] = f"抓取方向盘上料 17/17 lift height to {onload_release_lift_height:.3f}"
+                    robot_state["message"] = f"抓取方向盘上料 18/19 lift height to {onload_release_lift_height:.3f}"
                 post_insert_lift_command(
                     onload_release_lift_exec_mode,
                     onload_release_lift_height,
                     lift_speed,
-                    "抓取方向盘上料 17/17 lift_to_release_height",
+                    "抓取方向盘上料 18/19 lift_to_release_height",
+                )
+
+                assert_not_emergency("auto final close gripper")
+                with robot_lock:
+                    robot_state["message"] = "抓取方向盘上料 19/19 close gripper"
+                set_right_gripper_modbus(
+                    robot_ip=args.robot_ip,
+                    robot_port=args.robot_port,
+                    position=int(args.gripper_close_position),
+                    force=int(args.gripper_force),
+                    speed=int(args.gripper_speed),
+                    device_id=int(args.gripper_device_id),
+                    timeout_s=int(args.gripper_timeout_s),
                 )
 
                 msg = f"抓取方向盘上料 complete: {run_root}"
@@ -2140,8 +2037,28 @@ def main():
 
     @app.route("/robot/status")
     def robot_status():
+        data = {}
         with robot_lock:
-            return jsonify(dict(robot_state))
+            data.update(robot_state)
+        pose_sock = None
+        try:
+            pose_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            pose_sock.settimeout(0.5)
+            pose_sock.connect((args.robot_ip, int(args.robot_port)))
+            state = get_current_state(pose_sock)
+            if state:
+                pose_now, joint_now = state
+                data["pose"] = [float(x) for x in pose_now[:6]]
+                data["joint_deg"] = [float(x) for x in joint_now[:6]]
+        except Exception as exc:
+            data["pose_error"] = str(exc)
+        finally:
+            if pose_sock is not None:
+                try:
+                    pose_sock.close()
+                except Exception:
+                    pass
+        return jsonify(data)
 
     @app.route("/yolo/toggle", methods=["POST"])
     def yolo_toggle():
@@ -2165,6 +2082,19 @@ def main():
                     yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
                 time.sleep(0.03)
         return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+    try:
+        ensure_right_gripper_initialized(
+            robot_ip=args.robot_ip,
+            robot_port=args.robot_port,
+            device_id=int(args.gripper_device_id),
+            timeout_s=int(args.gripper_timeout_s),
+            force=int(args.gripper_force),
+            speed=int(args.gripper_speed),
+        )
+        print("[GRIPPER] initialized once at frontend startup")
+    except Exception as exc:
+        print(f"[GRIPPER WARN] startup initialization failed, will retry on first gripper command: {exc}")
 
     print(f"[INFO] open: http://<robot-ip>:{args.port}")
     app.run(host=args.host, port=args.port, threaded=True, debug=False, use_reloader=False)
