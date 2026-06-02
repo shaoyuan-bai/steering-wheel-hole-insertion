@@ -201,6 +201,7 @@ PAGE = """<!doctype html>
         <button onclick="runNormalAlignPreinsert()">法向对齐姿态</button>
         <button onclick="runLastPlanPreinsert()">按计划预插入</button>
         <button class="success" onclick="runLastPlanInsert()">插入 10mm</button>
+        <button class="success" onclick="runAutoAlignInsertOpen()">自动对齐插入</button>
       </div>
     </div>
     <aside>
@@ -223,6 +224,7 @@ PAGE = """<!doctype html>
           <button onclick="runRollSearchPreinsert()">保持姿态预插入</button>
           <button onclick="runNormalAlignPreinsert()">法向对齐姿态</button>
           <button onclick="runLastPlanPreinsert()">按计划预插入</button>
+          <button class="success" onclick="runAutoAlignInsertOpen()">自动对齐插入</button>
           <button class="success" onclick="runPostInsertPlace()">插入后放置流程</button>
           <button class="warn" onclick="runPostInsertReturn()">原路返回</button>
         </div>
@@ -384,6 +386,11 @@ PAGE = """<!doctype html>
     async function runLastPlanInsert() {
       if (!confirm(`确认不重新拍照，读取上次预插入计划，并沿当前工具轴小步前伸 10mm？插入速度=${speedPayload().frontend_insert_speed}`)) return;
       const s = await postJson('/robot/insert_last_plan', speedPayload());
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function runAutoAlignInsertOpen() {
+      if (!confirm(`确认执行自动对齐插入流程？将依次执行：法向对齐姿态、按计划预插入、4次插入10mm、打开夹爪、升降机上升0.02m、底盘后退0.3m。MoveJ速度=${speedPayload().movej_speed}，插入速度=${speedPayload().frontend_insert_speed}`)) return;
+      const s = await postJson('/robot/auto_align_insert_open', speedPayload());
       document.getElementById('robot').textContent = s.message || s.error || '';
     }
     async function runPostInsertPlace() {
@@ -1622,6 +1629,159 @@ def main():
 
         threading.Thread(target=worker, daemon=True).start()
         return jsonify({"ok": True, "message": f"insert started, speed={speed_config['frontend_insert_speed']}: {plan_path}"})
+
+    @app.route("/robot/auto_align_insert_open", methods=["POST"])
+    def auto_align_insert_open():
+        speed_config = request_speed_config()
+        with robot_lock:
+            if robot_state["busy"]:
+                return jsonify({"ok": False, "error": "robot command already running"}), 409
+            robot_state["busy"] = True
+            robot_state["message"] = "auto flow starting: normal align -> preinsert -> 4x insert -> open gripper -> lift up -> base back"
+            robot_state["last_plan"] = ""
+
+        def worker():
+            plan_json = None
+            try:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                run_root = Path(args.frontend_run_dir).expanduser().resolve() / f"frontend_{ts}_auto_align_insert_open"
+                capture_dir = run_root / "capture"
+                result_dir = run_root / "result"
+                result_dir.mkdir(parents=True, exist_ok=True)
+
+                runtime_config = load_config()
+                right_offset_m = float(cfg_get(runtime_config, "insertion", "observed_right_offset_m", default=args.right_offset_m))
+                up_offset_m = float(cfg_get(runtime_config, "insertion", "observed_up_offset_m", default=args.up_offset_m))
+                offset_frame = str(cfg_get(runtime_config, "insertion", "offset_frame", default="camera"))
+                tcp_to_tip_m = float(cfg_get(runtime_config, "tool", "tcp_to_tip_m", default=args.tcp_to_tip_m))
+                tip_tcp_m = cfg_get(runtime_config, "tool", "tip_tcp_m", default=args.tip_tcp_m)
+                preinsert_distance_m = float(cfg_get(runtime_config, "insertion", "preinsert_distance_m", default=args.preinsert_distance_m))
+                insert_depth_m = float(cfg_get(runtime_config, "insertion", "insert_depth_m", default=args.insert_depth_m))
+                max_preinsert_move_m = float(cfg_get(runtime_config, "insertion", "max_preinsert_move_m", default=args.max_preinsert_move_m))
+                post_seq = cfg_get(runtime_config, "post_insert_sequence", default={}) or {}
+                lift_speed = float(post_seq.get("lift_speed", 0.03))
+                base_speed = float(post_seq.get("base_speed", 0.10))
+                tip_tcp_arg = format_vec3_arg(tip_tcp_m)
+
+                with robot_lock:
+                    robot_state["message"] = "auto 1/10 capture RGBD and detect center hole"
+                saved_capture = streamer.save_current_capture(capture_dir)
+                if saved_capture is None:
+                    raise RuntimeError("no RGBD frame ready")
+
+                stem = f"frontend_yolo_{ts}"
+                detection_json = result_dir / f"{stem}_detection.json"
+                plan_json = result_dir / f"{stem}_plan.json"
+                detect_cmd = [
+                    sys.executable,
+                    str(SCRIPT_DIR / "detect_center_hole_yolo_rgbd.py"),
+                    str(saved_capture),
+                    "--out-dir", str(result_dir),
+                    "--out-stem", stem,
+                    "--conf", str(args.yolo_conf),
+                    "--min-confidence", "0.35",
+                ]
+                subprocess.run(detect_cmd, check=True)
+
+                with open(detection_json, "r", encoding="utf-8") as f:
+                    detection_payload = json.load(f)
+                if detection_payload.get("quality") != "ok":
+                    reasons = ", ".join(detection_payload.get("quality_reasons", [])) or "unknown"
+                    raise RuntimeError(f"detection quality={detection_payload.get('quality')}: {reasons}")
+
+                with robot_lock:
+                    robot_state["message"] = "auto 2/10 align orientation to normal"
+                align_cmd = [
+                    sys.executable,
+                    str(SCRIPT_DIR / "move_to_center_hole.py"),
+                    "--detection", str(detection_json),
+                    "--observed-right-offset-m", str(right_offset_m),
+                    "--observed-up-offset-m", str(up_offset_m),
+                    "--offset-frame", offset_frame,
+                    "--tcp-to-tip-m", str(tcp_to_tip_m),
+                    "--preinsert-distance-m", str(preinsert_distance_m),
+                    "--insert-depth-m", str(insert_depth_m),
+                    "--max-preinsert-move-m", str(max_preinsert_move_m),
+                    "--movej-speed", str(speed_config["movej_speed"]),
+                    "--max-j6-step-deg", str(args.max_j6_step_deg),
+                    "--plan-out", str(plan_json),
+                    "--require-quality-ok",
+                    "--move-preinsert",
+                    "--align-orientation-only",
+                    "--controller-pose-fallback",
+                ]
+                if tip_tcp_arg:
+                    align_cmd.append(f"--tip-tcp-m={tip_tcp_arg}")
+                print("[AUTO ALIGN CMD]", " ".join(str(x) for x in align_cmd))
+                subprocess.run(align_cmd, check=True)
+
+                with robot_lock:
+                    robot_state["last_plan"] = str(plan_json)
+                    robot_state["message"] = "auto 3/10 move to planned preinsert"
+                preinsert_cmd = [
+                    sys.executable,
+                    str(SCRIPT_DIR / "move_to_center_hole.py"),
+                    "--plan-in", str(plan_json),
+                    "--max-preinsert-move-m", str(args.max_preinsert_move_m),
+                    "--movej-speed", str(speed_config["movej_speed"]),
+                    "--max-j6-step-deg", str(args.max_j6_step_deg),
+                    "--require-quality-ok",
+                    "--move-preinsert",
+                    "--controller-pose-fallback",
+                ]
+                subprocess.run(preinsert_cmd, check=True)
+
+                for idx in range(4):
+                    with robot_lock:
+                        robot_state["message"] = f"auto {idx + 4}/10 insert 10mm step {idx + 1}/4"
+                    insert_cmd = [
+                        sys.executable,
+                        str(SCRIPT_DIR / "continue_insert_along_axis.py"),
+                        "--plan", str(plan_json),
+                        "--distance-m", str(args.frontend_insert_distance_m),
+                        "--max-distance-m", str(args.frontend_max_insert_distance_m),
+                        "--axis-source", "current-tool",
+                        "--tool-axis", "+z",
+                        "--speed", str(speed_config["frontend_insert_speed"]),
+                        "--robot-ip", str(args.robot_ip),
+                        "--robot-port", str(args.robot_port),
+                    ]
+                    subprocess.run(insert_cmd, check=True)
+                    if idx < 3:
+                        time.sleep(1.0)
+
+                with robot_lock:
+                    robot_state["message"] = "auto 8/10 open gripper"
+                set_right_gripper_modbus(
+                    robot_ip=args.robot_ip,
+                    robot_port=args.robot_port,
+                    position=int(args.gripper_open_position),
+                    force=int(args.gripper_force),
+                    speed=int(args.gripper_speed),
+                    device_id=int(args.gripper_device_id),
+                    timeout_s=int(args.gripper_timeout_s),
+                )
+
+                with robot_lock:
+                    robot_state["message"] = "auto 9/10 lift up 0.02m"
+                post_insert_lift(0.02, lift_speed, "auto 9/10 lift_up")
+
+                with robot_lock:
+                    robot_state["message"] = "auto 10/10 base backward -0.3m"
+                post_insert_step_forward(-0.3, base_speed, "auto 10/10 base_backward")
+
+                msg = f"auto align-insert-open-lift-back complete: {run_root}"
+            except Exception as exc:
+                msg = f"auto align-insert-open-lift-back error: {exc}"
+            finally:
+                with robot_lock:
+                    robot_state["busy"] = False
+                    robot_state["message"] = msg
+                    if plan_json is not None and Path(plan_json).exists():
+                        robot_state["last_plan"] = str(plan_json)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({"ok": True, "message": "auto align-insert-open started"})
 
     @app.route("/robot/status")
     def robot_status():
