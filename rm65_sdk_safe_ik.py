@@ -117,26 +117,26 @@ def _make_ik_params(q_now, target_pose):
     pose_arr = _float_array(pose)
 
     # Different RM_API2 Python builds expose q_in/q_pose as either C arrays,
-    # pointers, or wrapped properties. Try array assignment first, then pointer.
+    # pointers, or rm_pose_t. Try explicit compatible assignments and keep
+    # references alive on params for pointer-backed SDK builds.
     try:
         params.q_in = q_arr
     except TypeError:
         params.q_in = cast(q_arr, POINTER(c_float))
 
+    pose_struct = _pose_to_rm_pose(pose)
     try:
-        params.q_pose = pose_arr
+        params.q_pose = pose_struct
     except TypeError:
         try:
+            params.q_pose = pose_arr
+        except TypeError:
             params.q_pose = cast(pose_arr, POINTER(c_float))
-        except TypeError as exc:
-            raise TypeError(
-                "Unsupported rm_inverse_kinematics_params_t.q_pose type. "
-                "Expected a float array or float pointer; refusing to assign rm_pose_t."
-            ) from exc
 
     params.flag = 1
     params._q_in_array = q_arr
     params._q_pose_array = pose_arr
+    params._q_pose_struct = pose_struct
     return params
 
 

@@ -15,32 +15,35 @@ camera:
   warmup: 30
 
 hand_eye:
-  # Camera was bumped. Keep false until a fresh hand-eye calibration is written.
-  valid: false
+  # Updated from eye_hand_data/data20260601.
+  valid: true
   frame: "T_EE_CAM"
   matrix:
-    - [0.83343679, -0.55261378, 0.00106433, 0.02416865]
-    - [0.55261480, 0.83343547, -0.00148271, -0.10373028]
-    - [-0.00006769, 0.00182391, 0.99999833, 0.04847300]
+    - [0.85890465, -0.51167270, -0.02176798, 0.02093956]
+    - [0.51182742, 0.85908633, 0.00183437, -0.10130280]
+    - [0.01776197, -0.01271700, 0.99976137, 0.05238398]
     - [0.0, 0.0, 0.0, 1.0]
 
 tool:
   tool_axis: "+z"
-  tcp_to_tip_m: 0.1613
-  tip_tcp_m: [0.001787, -0.001436, 0.161261]
+  tcp_to_tip_m: 0.1598
+  tip_tcp_m: [-0.000003, 0.006021, 0.159636]
 
 motion:
-  initial_movej_speed: 50
-  movej_speed: 20
-  movel_speed: 3
-  frontend_insert_speed: 10
+  # Previous tested speeds before max-speed change:
+  # initial_movej_speed=50, movej_speed=20, movel_speed=3, frontend_insert_speed=10
+  initial_movej_speed: 100
+  movej_speed: 100
+  movel_speed: 100
+  frontend_insert_speed: 100
   max_joint_step_deg: 90.0
   max_j6_step_deg: 90.0
 
 insertion:
-  observed_right_offset_m: 0.0025
-  observed_up_offset_m: 0.0030
-  preinsert_distance_m: 0.080
+  offset_frame: "camera"
+  observed_right_offset_m: -0.0050
+  observed_up_offset_m: 0.0080
+  preinsert_distance_m: 0.040
   insert_depth_m: 0.002
   frontend_insert_distance_m: 0.010
   frontend_max_insert_distance_m: 0.010
@@ -78,3 +81,47 @@ paths:
 recording:
   fps: 10.0
   robot_timeout_s: 1.0
+
+mobile_base:
+  base_url: "http://192.168.2.228:5001"
+  timeout_s: 30.0
+
+placement:
+  poses_file: "table_place_poses.json"
+  movej_speed: 30
+  descend_speed: 5
+  retreat_speed: 10
+  lift_exec_mode: 2
+  lift_speed: 0.03
+  # Sign depends on lift API convention. Test with dry-run and a small value first.
+  lift_lower_height_m: -0.10
+  lift_raise_height_m: 0.10
+  settle_s: 0.5
+  max_current_to_pre_m: 0.80
+  max_descend_m: 0.20
+  max_retreat_m: 0.20
+  gripper_action: "close"
+
+post_insert_sequence:
+  poses_file: "table_place_poses.json"
+  first_lift_height_m: 0.01
+  backward_distance_m: -0.20
+  rotate_angle_deg: -90.0
+  forward_distance_m: 1.00
+  place_lift_lower_height_m: -0.10
+  place_lift_raise_height_m: 0.10
+  lift_speed: 0.03
+  base_speed: 0.10
+  rotate_speed: 0.20
+  settle_s: 1.0
+  movej_speed: 30
+  max_current_to_pre_m: 1.20
+
+post_insert_return_sequence:
+  lift_height_m: -0.01
+  backward_distance_m: -1.00
+  rotate_angle_deg: 90.0
+  forward_distance_m: 0.20
+  lift_speed: 0.03
+  base_speed: 0.10
+  rotate_speed: 0.20

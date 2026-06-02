@@ -22,8 +22,10 @@ clicked target.
 
 import json
 import socket
+import sys
 import time
 import traceback
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -33,15 +35,23 @@ from scipy.spatial.transform import Rotation as R
 from rm65_sdk_safe_ik import Rm65SafeIkMover
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+WHEEL_INSERTION_DIR = SCRIPT_DIR / "wheel_hole_insertion"
+if str(WHEEL_INSERTION_DIR) not in sys.path:
+    sys.path.insert(0, str(WHEEL_INSERTION_DIR))
+
+from config_loader import CONFIG, cfg_get  # noqa: E402
+
+
 SCRIPT_VERSION = "2026-05-13-right-click-t-pregrasp-g-grasp-v6"
 
 
 # -------------------- Hardware and motion config --------------------
-ROBOT_IP = "169.254.128.21"
-ROBOT_PORT = 8080
+ROBOT_IP = str(cfg_get(CONFIG, "robot", "ip", default="169.254.128.21"))
+ROBOT_PORT = int(cfg_get(CONFIG, "robot", "port", default=8080))
 
-MOVE_SPEED = 20
-T_MOVEJ_SPEED = 10
+MOVE_SPEED = int(cfg_get(CONFIG, "motion", "movej_speed", default=20))
+T_MOVEJ_SPEED = int(cfg_get(CONFIG, "motion", "movej_speed", default=10))
 T_MOVEL_SPEED = 8
 STOP_DISTANCE_M = 0.15
 MIN_MOVE_DISTANCE_M = 0.005
@@ -50,7 +60,7 @@ MIN_MOVE_DISTANCE_M = 0.005
 # The clicked target is the desired gripper pinch point. The robot command pose
 # is still the TCP pose, so the TCP must stay this far behind the target along
 # the approach direction. Measure and tune this on your actual gripper/adapter.
-TCP_TO_PINCH_M = 0.15
+TCP_TO_PINCH_M = float(cfg_get(CONFIG, "tool", "tcp_to_tip_m", default=0.15))
 PREGRASP_EXTRA_DISTANCE_M = 0.10
 
 # Safety limits for the conservative t path. Keep these tight while testing.
@@ -81,20 +91,16 @@ MAX_VALID_DEPTH_M = 2.00
 
 # Auto-orientation mode for y.
 TOOL_Z_TARGET_SIGN = 1
-SDK_FORCE_TYPE_NAME = "RM_MODEL_RM_SF_E"
+SDK_FORCE_TYPE_NAME = str(cfg_get(CONFIG, "robot", "force_type_name", default="RM_MODEL_RM_SF_E"))
 AUTO_ROLL_CANDIDATES_DEG = [
     0, 15, -15, 30, -30, 45, -45, 60, -60, 90, -90, 120, -120, 180
 ]
 
 
-# Right-arm hand-eye calibration matrix T_ee_cam.
-# Translation unit: meters.
-T_EE_CAM = np.array([
-    [0.83343679, -0.55261378, 0.00106433, 0.02416865],
-    [0.55261480, 0.83343547, -0.00148271, -0.10373028],
-    [-0.00006769, 0.00182391, 0.99999833, 0.04847300],
-    [0.0, 0.0, 0.0, 1.0],
-], dtype=np.float64)
+HAND_EYE_VALID = bool(cfg_get(CONFIG, "hand_eye", "valid", default=False))
+T_EE_CAM = np.array(cfg_get(CONFIG, "hand_eye", "matrix"), dtype=np.float64)
+if T_EE_CAM.shape != (4, 4):
+    raise ValueError("wheel_hole_insertion/config.yaml hand_eye.matrix must be 4x4.")
 
 
 clicked_pixel = None
@@ -192,6 +198,16 @@ def clicked_point_to_base(depth_img, intr, depth_scale, pose_now, pixel):
         return None, None
     p_cam = rs.rs2_deproject_pixel_to_point(intr, [float(u), float(v)], depth_m)
     return cam_to_base(pose_now, p_cam), depth_m
+
+
+def require_valid_hand_eye_for_motion():
+    if HAND_EYE_VALID:
+        return True
+    print(
+        "[安全] wheel_hole_insertion/config.yaml 中 hand_eye.valid=false，"
+        "right.py 不会发送运动指令。重新手眼标定并更新配置后再运行。"
+    )
+    return False
 
 
 def compute_standoff_point(current_pos, target_pos):
@@ -701,6 +717,8 @@ def main():
         sock.connect((ROBOT_IP, ROBOT_PORT))
         print(f"[OK] right arm socket connected: {ROBOT_IP}:{ROBOT_PORT}")
         print(f"[INFO] script version: {SCRIPT_VERSION}")
+        print(f"[INFO] config: {CONFIG.get('_config_path')}")
+        print(f"[INFO] hand_eye.valid={HAND_EYE_VALID}")
     except Exception as exc:
         print(f"[FAIL] socket connect failed: {exc}")
         return
@@ -738,6 +756,8 @@ def main():
     print(">>> g: use cached target from t and short MOVEL to grasp.")
     print(">>> y: experimental auto orientation + SDK safe IK + MOVEJ.")
     print(">>> c: clear point, q: quit.")
+    if not HAND_EYE_VALID:
+        print(">>> SAFETY: hand_eye.valid=false, t/g/y motion commands are blocked.")
     print(f">>> y stop distance: {STOP_DISTANCE_M * 1000:.0f} mm.")
     print(
         f">>> t plan: clicked point is pinch target, TCP-to-pinch={TCP_TO_PINCH_M * 1000:.0f} mm, "
@@ -780,6 +800,8 @@ def main():
                 print("[RESET] cached grasp plan cleared")
                 continue
             if key == ord("g"):
+                if not require_valid_hand_eye_for_motion():
+                    continue
                 if cached_grasp_plan is None:
                     print("[WARN] No cached grasp plan. Click target and press 't' first.")
                     continue
@@ -794,6 +816,8 @@ def main():
                 continue
             if clicked_pixel is None:
                 print("[WARN] No clicked point. Left-click a target first.")
+                continue
+            if not require_valid_hand_eye_for_motion():
                 continue
 
             state_now = get_current_state(sock)

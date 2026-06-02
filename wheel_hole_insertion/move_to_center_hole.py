@@ -98,13 +98,25 @@ def build_plan_from_base(pose_now, center_base, normal_base, args, quality="base
         insert_axis_base = -insert_axis_base
     insert_axis_base = normalize(insert_axis_base, "insert_axis_base")
 
-    view_up_base = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-    view_up_base = view_up_base - insert_axis_base * float(np.dot(view_up_base, insert_axis_base))
-    if np.linalg.norm(view_up_base) < 1e-6:
-        view_up_base = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    offset_frame = str(getattr(args, "offset_frame", "camera")).lower()
+    if offset_frame == "camera":
+        t_base_cam = pose_to_matrix(pose_now) @ T_EE_CAM
+        view_right_base = t_base_cam[:3, 0]
+        view_up_base = -t_base_cam[:3, 1]
+        view_right_base = view_right_base - insert_axis_base * float(np.dot(view_right_base, insert_axis_base))
         view_up_base = view_up_base - insert_axis_base * float(np.dot(view_up_base, insert_axis_base))
-    view_up_base = normalize(view_up_base, "view_up_base")
-    view_right_base = normalize(np.cross(view_up_base, insert_axis_base), "view_right_base")
+        if np.linalg.norm(view_right_base) < 1e-6 or np.linalg.norm(view_up_base) < 1e-6:
+            raise RuntimeError("Camera offset axes are nearly parallel to insertion axis.")
+        view_right_base = normalize(view_right_base, "camera_view_right_base")
+        view_up_base = normalize(view_up_base, "camera_view_up_base")
+    else:
+        view_up_base = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        view_up_base = view_up_base - insert_axis_base * float(np.dot(view_up_base, insert_axis_base))
+        if np.linalg.norm(view_up_base) < 1e-6:
+            view_up_base = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            view_up_base = view_up_base - insert_axis_base * float(np.dot(view_up_base, insert_axis_base))
+        view_up_base = normalize(view_up_base, "view_up_base")
+        view_right_base = normalize(np.cross(view_up_base, insert_axis_base), "view_right_base")
 
     # Positive observed offsets mean "the rod appears right/up from the hole"
     # when looking from the robot toward the hole. Compensate by moving the
@@ -157,6 +169,7 @@ def build_plan_from_base(pose_now, center_base, normal_base, args, quality="base
         "insert_axis_base": insert_axis_base.tolist(),
         "view_right_base": view_right_base.tolist(),
         "view_up_base": view_up_base.tolist(),
+        "offset_frame": offset_frame,
         "visual_correction_base_m": visual_correction_base.tolist(),
         "preinsert_pose": pre_pose,
         "final_pose": final_pose,
@@ -504,6 +517,8 @@ def parse_args():
     parser.add_argument("--observed-up-offset-m", type=float,
                         default=float(cfg_get(CONFIG, "insertion", "observed_up_offset_m", default=0.0)),
                         help="Observed rod offset above the hole, from robot-to-hole view. Target is compensated down.")
+    parser.add_argument("--offset-frame", choices=["camera", "base"], default=cfg_get(CONFIG, "insertion", "offset_frame", default="camera"),
+                        help="Frame used by observed right/up offsets. camera means image right/up projected to the hole plane.")
     parser.add_argument("--robot-ip", default=DEFAULT_ROBOT_IP)
     parser.add_argument("--robot-port", type=int, default=DEFAULT_ROBOT_PORT)
     parser.add_argument("--tool-axis", default=cfg_get(CONFIG, "tool", "tool_axis", default="+z"),

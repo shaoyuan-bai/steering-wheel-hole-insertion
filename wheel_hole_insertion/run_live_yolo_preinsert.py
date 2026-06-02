@@ -42,6 +42,19 @@ def confirm_or_skip(prompt, yes):
     return answer == "y"
 
 
+def format_vec3_arg(value):
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return ""
+        return ",".join(str(float(x)) for x in value[:3])
+    text = str(value).strip()
+    if not text:
+        return ""
+    return text.replace(" ", "")
+
+
 def move_to_initial(args):
     sys.path.insert(0, str(ROOT))
     from rm65_sdk_safe_ik import Rm65SafeIkMover
@@ -161,7 +174,6 @@ def main():
         "--observed-right-offset-m", str(args.right_offset_m),
         "--observed-up-offset-m", str(args.up_offset_m),
         "--tcp-to-tip-m", str(args.tcp_to_tip_m),
-        "--tip-tcp-m", str(args.tip_tcp_m),
         "--preinsert-distance-m", str(args.preinsert_distance_m),
         "--insert-depth-m", str(args.insert_depth_m),
         "--max-preinsert-move-m", str(args.max_preinsert_move_m),
@@ -170,6 +182,9 @@ def main():
         "--max-j6-step-deg", str(args.max_j6_step_deg),
         "--plan-out", str(plan_json),
     ]
+    tip_tcp_arg = format_vec3_arg(args.tip_tcp_m)
+    if tip_tcp_arg:
+        plan_cmd.append(f"--tip-tcp-m={tip_tcp_arg}")
     if args.require_quality_ok or not args.allow_non_ok_quality:
         plan_cmd.append("--require-quality-ok")
     else:

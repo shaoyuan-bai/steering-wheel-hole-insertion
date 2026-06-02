@@ -8,6 +8,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import cv2
@@ -21,7 +23,7 @@ ROOT = SCRIPT_DIR.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from insert_center_hole import get_current_state  # noqa: E402
-from config_loader import CONFIG, cfg_get, relative_path  # noqa: E402
+from config_loader import CONFIG, cfg_get, load_config, relative_path  # noqa: E402
 from infer_center_hole_onnx import crop_mask_to_box, letterbox, nms, sigmoid  # noqa: E402
 from rm65_sdk_safe_ik import Rm65SafeIkMover  # noqa: E402
 
@@ -51,6 +53,30 @@ def set_right_gripper_modbus(robot_ip, robot_port, position, force, speed, devic
         time.sleep(0.8)
 
 
+def post_external_json(url, payload, timeout_s=5.0):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
+            body = resp.read().decode("utf-8", "ignore")
+            try:
+                parsed = json.loads(body) if body else {}
+            except json.JSONDecodeError:
+                parsed = {"raw": body}
+            return {
+                "status": int(resp.status),
+                "body": parsed,
+            }
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "ignore")
+        raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
+
+
 def intrinsics_to_dict(intr):
     return {
         "width": int(intr.width),
@@ -72,6 +98,19 @@ def find_latest_frontend_plan(frontend_run_dir):
         reverse=True,
     )
     return candidates[0] if candidates else None
+
+
+def format_vec3_arg(value):
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return ""
+        return ",".join(str(float(x)) for x in value[:3])
+    text = str(value).strip()
+    if not text:
+        return ""
+    return text.replace(" ", "")
 
 
 PAGE = """<!doctype html>
@@ -184,6 +223,8 @@ PAGE = """<!doctype html>
           <button onclick="runRollSearchPreinsert()">保持姿态预插入</button>
           <button onclick="runNormalAlignPreinsert()">法向对齐姿态</button>
           <button onclick="runLastPlanPreinsert()">按计划预插入</button>
+          <button class="success" onclick="runPostInsertPlace()">插入后放置流程</button>
+          <button class="warn" onclick="runPostInsertReturn()">原路返回</button>
         </div>
       </section>
       <section>
@@ -216,6 +257,40 @@ PAGE = """<!doctype html>
           <div class="row"><span class="k">帧数</span><span id="recordFrames" class="v"></span></div>
           <div class="row"><span class="k">输出目录</span><span id="recordPath" class="v"></span></div>
           <div class="row"><span class="k">截图</span><span id="shot" class="v"></span></div>
+        </div>
+      </section>
+      <section>
+        <h2>底盘与升降</h2>
+        <div class="speed-grid">
+          <div class="speed-field">
+            <label for="liftHeight">升降高度 m</label>
+            <input id="liftHeight" type="number" step="0.01" value="0.05">
+          </div>
+          <div class="speed-field">
+            <label for="liftSpeed">升降速度</label>
+            <input id="liftSpeed" type="number" step="0.01" value="0.03">
+          </div>
+          <div class="speed-field">
+            <label for="baseDistance">前后距离</label>
+            <input id="baseDistance" type="number" step="0.1" value="-2.5">
+          </div>
+          <div class="speed-field">
+            <label for="baseSpeed">前后速度</label>
+            <input id="baseSpeed" type="number" step="0.01" value="0.1">
+          </div>
+          <div class="speed-field">
+            <label for="rotateAngleDeg">旋转角度 deg</label>
+            <input id="rotateAngleDeg" type="number" step="1" value="-90">
+          </div>
+          <div class="speed-field">
+            <label for="rotateSpeed">旋转速度</label>
+            <input id="rotateSpeed" type="number" step="0.01" value="0.2">
+          </div>
+        </div>
+        <div class="stack">
+          <button class="secondary" onclick="liftMove()">升降机移动</button>
+          <button class="secondary" onclick="baseStepForward()">整体前后移动</button>
+          <button class="secondary" onclick="baseStepRotate()">整体旋转</button>
         </div>
       </section>
       <section>
@@ -311,6 +386,16 @@ PAGE = """<!doctype html>
       const s = await postJson('/robot/insert_last_plan', speedPayload());
       document.getElementById('robot').textContent = s.message || s.error || '';
     }
+    async function runPostInsertPlace() {
+      if (!confirm('确认执行插入后放置流程？将依次执行升降机抬升、底盘后退、旋转、前进、机械臂到下降姿态、升降机下降、闭合夹爪、升降机抬起。')) return;
+      const s = await postJson('/robot/post_insert_place_sequence', speedPayload());
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function runPostInsertReturn() {
+      if (!confirm('确认执行原路返回？将依次执行升降机回落、底盘后退、旋转回正、前进回到原路位置。')) return;
+      const s = await postJson('/robot/post_insert_return_sequence', speedPayload());
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
     async function robotStop() {
       const s = await postJson('/robot/stop');
       document.getElementById('robot').textContent = s.message || s.error || '';
@@ -335,6 +420,35 @@ PAGE = """<!doctype html>
     }
     async function recordStop() {
       const s = await postJson('/recording/stop');
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function liftMove() {
+      const payload = {
+        execMode: 2,
+        speed: Number(document.getElementById('liftSpeed').value || 0.03),
+        height: Number(document.getElementById('liftHeight').value || 0.05),
+      };
+      if (!confirm(`确认升降机移动？height=${payload.height}, speed=${payload.speed}`)) return;
+      const s = await postJson('/mobile/lift', payload);
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function baseStepForward() {
+      const payload = {
+        distance: Number(document.getElementById('baseDistance').value || -2.5),
+        speed: Number(document.getElementById('baseSpeed').value || 0.1),
+      };
+      if (!confirm(`确认整体前后移动？distance=${payload.distance}, speed=${payload.speed}`)) return;
+      const s = await postJson('/mobile/step_forward', payload);
+      document.getElementById('robot').textContent = s.message || s.error || '';
+    }
+    async function baseStepRotate() {
+      const angleDeg = Number(document.getElementById('rotateAngleDeg').value || -90);
+      const payload = {
+        angle: angleDeg * Math.PI / 180.0,
+        speed: Number(document.getElementById('rotateSpeed').value || 0.2),
+      };
+      if (!confirm(`确认整体旋转？angle=${angleDeg}° (${payload.angle.toFixed(4)} rad), speed=${payload.speed}`)) return;
+      const s = await postJson('/mobile/step_rotate', payload);
       document.getElementById('robot').textContent = s.message || s.error || '';
     }
     setInterval(refresh, 1000);
@@ -857,6 +971,9 @@ def parse_args():
     parser.add_argument("--recording-dir", default=str(relative_path(CONFIG, "paths", "recording_dir", default="vla_recordings")))
     parser.add_argument("--recording-fps", type=float, default=float(cfg_get(CONFIG, "recording", "fps", default=10.0)))
     parser.add_argument("--recording-robot-timeout-s", type=float, default=float(cfg_get(CONFIG, "recording", "robot_timeout_s", default=1.0)))
+    parser.add_argument("--mobile-base-url", default=str(cfg_get(CONFIG, "mobile_base", "base_url", default="http://192.168.2.228:5001")))
+    parser.add_argument("--mobile-timeout-s", type=float, default=float(cfg_get(CONFIG, "mobile_base", "timeout_s", default=5.0)))
+    parser.add_argument("--post-insert-poses", default=str(relative_path(CONFIG, "post_insert_sequence", "poses_file", default="table_place_poses.json")))
     return parser.parse_args()
 
 
@@ -1015,6 +1132,283 @@ def main():
     def gripper_close():
         return start_gripper_action("close", args.gripper_close_position)
 
+    def mobile_post(endpoint, payload, action_name):
+        url = args.mobile_base_url.rstrip("/") + endpoint
+        with robot_lock:
+            if robot_state["busy"]:
+                return jsonify({"ok": False, "error": "robot command already running"}), 409
+            robot_state["busy"] = True
+            robot_state["message"] = f"{action_name} running: {payload}"
+
+        def worker():
+            try:
+                result = post_external_json(url, payload, timeout_s=args.mobile_timeout_s)
+                msg = f"{action_name} ok: {result}"
+            except Exception as exc:
+                msg = f"{action_name} error: {exc}"
+            finally:
+                with robot_lock:
+                    robot_state["busy"] = False
+                    robot_state["message"] = msg
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({"ok": True, "message": f"{action_name} started: {payload}"})
+
+    @app.route("/mobile/lift", methods=["POST"])
+    def mobile_lift():
+        payload = request.get_json(silent=True) or {}
+        clean = {
+            "execMode": int(payload.get("execMode", 2)),
+            "speed": float(payload.get("speed", 0.03)),
+            "height": float(payload.get("height", 0.05)),
+        }
+        return mobile_post("/lift_control3", clean, "lift")
+
+    @app.route("/mobile/step_forward", methods=["POST"])
+    def mobile_step_forward():
+        payload = request.get_json(silent=True) or {}
+        clean = {
+            "distance": float(payload.get("distance", -2.5)),
+            "speed": float(payload.get("speed", 0.1)),
+        }
+        return mobile_post("/step_forward", clean, "step_forward")
+
+    @app.route("/mobile/step_rotate", methods=["POST"])
+    def mobile_step_rotate():
+        payload = request.get_json(silent=True) or {}
+        clean = {
+            "angle": float(payload.get("angle", -1.57)),
+            "speed": float(payload.get("speed", 0.2)),
+        }
+        return mobile_post("/step_rotate", clean, "step_rotate")
+
+    def load_post_insert_pre_place():
+        path = Path(args.post_insert_poses).expanduser().resolve()
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        pre = data.get("poses", {}).get("pre_place")
+        if not pre or "joint_deg" not in pre or "pose" not in pre:
+            raise RuntimeError(f"{path} missing poses.pre_place.pose/joint_deg")
+        return path, pre
+
+    def mobile_post_sync(endpoint, payload, label):
+        url = args.mobile_base_url.rstrip("/") + endpoint
+        print(f"[POST-INSERT] {label}: POST {url} {payload}")
+        result = post_external_json(url, payload, timeout_s=args.mobile_timeout_s)
+        print(f"[POST-INSERT] {label}: {result}")
+        return result
+
+    def post_insert_lift(height, speed, label):
+        return mobile_post_sync(
+            "/lift_control3",
+            {"execMode": 2, "speed": float(speed), "height": float(height)},
+            label,
+        )
+
+    def post_insert_lift_query(label):
+        return mobile_post_sync("/lift_control3", {"execMode": 0}, label)
+
+    def post_insert_step_forward(distance, speed, label):
+        return mobile_post_sync(
+            "/step_forward",
+            {"distance": float(distance), "speed": float(speed)},
+            label,
+        )
+
+    def post_insert_step_rotate(angle_rad, speed, label):
+        return mobile_post_sync(
+            "/step_rotate",
+            {"angle": float(angle_rad), "speed": float(speed)},
+            label,
+        )
+
+    @app.route("/robot/post_insert_place_sequence", methods=["POST"])
+    def post_insert_place_sequence():
+        speed_config = request_speed_config()
+        with robot_lock:
+            if robot_state["busy"]:
+                return jsonify({"ok": False, "error": "robot command already running"}), 409
+            robot_state["busy"] = True
+            robot_state["message"] = "post-insert place sequence starting"
+
+        def worker():
+            mover = None
+            try:
+                runtime_config = load_config()
+                seq = cfg_get(runtime_config, "post_insert_sequence", default={}) or {}
+                first_lift = float(seq.get("first_lift_height_m", 0.01))
+                backward = float(seq.get("backward_distance_m", -0.20))
+                rotate_deg = float(seq.get("rotate_angle_deg", -90.0))
+                forward = float(seq.get("forward_distance_m", 1.00))
+                lower = float(seq.get("place_lift_lower_height_m", -0.10))
+                raise_h = float(seq.get("place_lift_raise_height_m", 0.10))
+                lift_speed = float(seq.get("lift_speed", 0.03))
+                base_speed = float(seq.get("base_speed", 0.10))
+                rotate_speed = float(seq.get("rotate_speed", 0.20))
+                settle_s = float(seq.get("settle_s", 1.0))
+                movej_speed = int(seq.get("movej_speed", speed_config["movej_speed"]))
+                max_current_to_pre = float(seq.get("max_current_to_pre_m", 1.20))
+
+                poses_path, pre = load_post_insert_pre_place()
+                print(f"[POST-INSERT] loaded pre_place: {poses_path}")
+                steps = [
+                    "1 lift +0.01",
+                    "2 base backward",
+                    "3 base rotate",
+                    "4 arm to pre_place",
+                    "5 base forward",
+                    "6 lift lower",
+                    "7 close gripper",
+                    "8 lift raise",
+                ]
+                print(f"[POST-INSERT] steps: {steps}")
+
+                with robot_lock:
+                    robot_state["message"] = "post-insert 1/8 lift up"
+                post_insert_lift(first_lift, lift_speed, "1/8 lift_up")
+
+                with robot_lock:
+                    robot_state["message"] = "post-insert 2/8 base backward"
+                post_insert_step_forward(backward, base_speed, "2/8 base_backward")
+
+                with robot_lock:
+                    robot_state["message"] = "post-insert 3/8 base rotate"
+                post_insert_step_rotate(np.deg2rad(rotate_deg), rotate_speed, "3/8 base_rotate")
+
+                current_pose = None
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.connect((args.robot_ip, int(args.robot_port)))
+                    state = get_current_state(sock)
+                    if state:
+                        current_pose, _ = state
+                finally:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                if current_pose is not None:
+                    dist = float(np.linalg.norm(np.asarray(current_pose[:3]) - np.asarray(pre["pose"][:3])))
+                    if dist > max_current_to_pre:
+                        raise RuntimeError(
+                            f"current->pre_place {dist * 1000.0:.1f} mm exceeds "
+                            f"{max_current_to_pre * 1000.0:.1f} mm"
+                        )
+
+                with robot_lock:
+                    robot_state["message"] = "post-insert 4/8 arm to pre_place"
+                mover = Rm65SafeIkMover(
+                    robot_ip=args.robot_ip,
+                    robot_port=args.robot_port,
+                    speed=movej_speed,
+                    max_joint_step_deg=120,
+                    max_j6_step_deg=120,
+                )
+                mover.connect()
+                ret = mover.movej([float(x) for x in pre["joint_deg"][:6]])
+                print(f"[POST-INSERT] 4/8 movej pre_place ret={ret}")
+                if ret != 0:
+                    raise RuntimeError(f"movej pre_place failed, ret={ret}")
+
+                with robot_lock:
+                    robot_state["message"] = "post-insert 5/8 base forward"
+                post_insert_step_forward(forward, base_speed, "5/8 base_forward")
+
+                with robot_lock:
+                    robot_state["message"] = "post-insert query lift pre-place"
+                post_insert_lift_query("pre_place_lift_state")
+
+                with robot_lock:
+                    robot_state["message"] = "post-insert 6/8 lift lower"
+                post_insert_lift(lower, lift_speed, "6/8 lift_lower")
+
+                with robot_lock:
+                    robot_state["message"] = "post-insert 7/8 close gripper"
+                set_right_gripper_modbus(
+                    robot_ip=args.robot_ip,
+                    robot_port=args.robot_port,
+                    position=int(args.gripper_close_position),
+                    force=int(args.gripper_force),
+                    speed=int(args.gripper_speed),
+                    device_id=int(args.gripper_device_id),
+                    timeout_s=int(args.gripper_timeout_s),
+                )
+                time.sleep(max(0.0, settle_s))
+
+                with robot_lock:
+                    robot_state["message"] = "post-insert 8/8 lift raise"
+                post_insert_lift(raise_h, lift_speed, "8/8 lift_raise")
+                msg = "post-insert place sequence complete"
+            except Exception as exc:
+                msg = f"post-insert place sequence error: {exc}"
+            finally:
+                if mover is not None:
+                    try:
+                        mover.close()
+                    except Exception:
+                        pass
+                with robot_lock:
+                    robot_state["busy"] = False
+                    robot_state["message"] = msg
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({"ok": True, "message": "post-insert place sequence started"})
+
+    @app.route("/robot/post_insert_return_sequence", methods=["POST"])
+    def post_insert_return_sequence():
+        with robot_lock:
+            if robot_state["busy"]:
+                return jsonify({"ok": False, "error": "robot command already running"}), 409
+            robot_state["busy"] = True
+            robot_state["message"] = "post-insert return sequence starting"
+
+        def worker():
+            try:
+                runtime_config = load_config()
+                seq = cfg_get(runtime_config, "post_insert_return_sequence", default={}) or {}
+                lift_h = float(seq.get("lift_height_m", -0.01))
+                backward = float(seq.get("backward_distance_m", -1.00))
+                rotate_deg = float(seq.get("rotate_angle_deg", 90.0))
+                forward = float(seq.get("forward_distance_m", 0.20))
+                lift_speed = float(seq.get("lift_speed", 0.03))
+                base_speed = float(seq.get("base_speed", 0.10))
+                rotate_speed = float(seq.get("rotate_speed", 0.20))
+
+                steps = [
+                    "1 lift return",
+                    "2 base backward",
+                    "3 base rotate back",
+                    "4 base forward",
+                ]
+                print(f"[POST-RETURN] steps: {steps}")
+
+                with robot_lock:
+                    robot_state["message"] = "post-return 1/4 lift return"
+                post_insert_lift(lift_h, lift_speed, "return 1/4 lift")
+
+                with robot_lock:
+                    robot_state["message"] = "post-return 2/4 base backward"
+                post_insert_step_forward(backward, base_speed, "return 2/4 base_backward")
+
+                with robot_lock:
+                    robot_state["message"] = "post-return 3/4 base rotate"
+                post_insert_step_rotate(np.deg2rad(rotate_deg), rotate_speed, "return 3/4 base_rotate")
+
+                with robot_lock:
+                    robot_state["message"] = "post-return 4/4 base forward"
+                post_insert_step_forward(forward, base_speed, "return 4/4 base_forward")
+
+                msg = "post-insert return sequence complete"
+            except Exception as exc:
+                msg = f"post-insert return sequence error: {exc}"
+            finally:
+                with robot_lock:
+                    robot_state["busy"] = False
+                    robot_state["message"] = msg
+
+        threading.Thread(target=worker, daemon=True).start()
+        return jsonify({"ok": True, "message": "post-insert return sequence started"})
+
     def start_live_preinsert(mode="normal"):
         speed_config = request_speed_config()
         with robot_lock:
@@ -1022,6 +1416,7 @@ def main():
                 return jsonify({"ok": False, "error": "robot command already running"}), 409
             robot_state["busy"] = True
             robot_state["message"] = f"{mode} preinsert running, movej_speed={speed_config['movej_speed']}"
+            robot_state["last_plan"] = ""
 
         def worker():
             ts = time.strftime("%Y%m%d_%H%M%S")
@@ -1031,6 +1426,30 @@ def main():
             result_dir = run_root / "result"
             result_dir.mkdir(parents=True, exist_ok=True)
             try:
+                if mode == "normal_align":
+                    with robot_lock:
+                        robot_state["message"] = "normal_align: closing gripper before alignment"
+                    set_right_gripper_modbus(
+                        robot_ip=args.robot_ip,
+                        robot_port=args.robot_port,
+                        position=int(args.gripper_close_position),
+                        force=int(args.gripper_force),
+                        speed=int(args.gripper_speed),
+                        device_id=int(args.gripper_device_id),
+                        timeout_s=int(args.gripper_timeout_s),
+                    )
+                    time.sleep(0.2)
+
+                runtime_config = load_config()
+                right_offset_m = float(cfg_get(runtime_config, "insertion", "observed_right_offset_m", default=args.right_offset_m))
+                up_offset_m = float(cfg_get(runtime_config, "insertion", "observed_up_offset_m", default=args.up_offset_m))
+                offset_frame = str(cfg_get(runtime_config, "insertion", "offset_frame", default="camera"))
+                tcp_to_tip_m = float(cfg_get(runtime_config, "tool", "tcp_to_tip_m", default=args.tcp_to_tip_m))
+                tip_tcp_m = cfg_get(runtime_config, "tool", "tip_tcp_m", default=args.tip_tcp_m)
+                preinsert_distance_m = float(cfg_get(runtime_config, "insertion", "preinsert_distance_m", default=args.preinsert_distance_m))
+                insert_depth_m = float(cfg_get(runtime_config, "insertion", "insert_depth_m", default=args.insert_depth_m))
+                max_preinsert_move_m = float(cfg_get(runtime_config, "insertion", "max_preinsert_move_m", default=args.max_preinsert_move_m))
+
                 saved_capture = streamer.save_current_capture(capture_dir)
                 if saved_capture is None:
                     raise RuntimeError("no RGBD frame ready")
@@ -1050,19 +1469,22 @@ def main():
                     sys.executable,
                     str(SCRIPT_DIR / "move_to_center_hole.py"),
                     "--detection", str(detection_json),
-                    "--observed-right-offset-m", str(args.right_offset_m),
-                    "--observed-up-offset-m", str(args.up_offset_m),
-                    "--tcp-to-tip-m", str(args.tcp_to_tip_m),
-                    "--tip-tcp-m", str(args.tip_tcp_m),
-                    "--preinsert-distance-m", str(args.preinsert_distance_m),
-                    "--insert-depth-m", str(args.insert_depth_m),
-                    "--max-preinsert-move-m", str(args.max_preinsert_move_m),
+                    "--observed-right-offset-m", str(right_offset_m),
+                    "--observed-up-offset-m", str(up_offset_m),
+                    "--offset-frame", offset_frame,
+                    "--tcp-to-tip-m", str(tcp_to_tip_m),
+                    "--preinsert-distance-m", str(preinsert_distance_m),
+                    "--insert-depth-m", str(insert_depth_m),
+                    "--max-preinsert-move-m", str(max_preinsert_move_m),
                     "--movej-speed", str(speed_config["movej_speed"]),
                     "--max-j6-step-deg", str(args.max_j6_step_deg),
                     "--plan-out", str(plan_json),
                     "--require-quality-ok",
                     "--move-preinsert",
                 ]
+                tip_tcp_arg = format_vec3_arg(tip_tcp_m)
+                if tip_tcp_arg:
+                    move_cmd.append(f"--tip-tcp-m={tip_tcp_arg}")
                 if mode == "roll_search":
                     move_cmd.extend([
                         "--keep-current-orientation",
@@ -1074,6 +1496,11 @@ def main():
                         "--align-orientation-only",
                         "--controller-pose-fallback",
                     ])
+                print(
+                    f"[FRONTEND PLAN] offsets right/up={right_offset_m:.4f}/{up_offset_m:.4f} m, "
+                    f"offset_frame={offset_frame}, "
+                    f"tcp_to_tip={tcp_to_tip_m:.4f} m, tip_tcp={tip_tcp_arg}"
+                )
                 subprocess.run(detect_cmd, check=True)
                 try:
                     with open(detection_json, "r", encoding="utf-8") as f:
@@ -1087,6 +1514,7 @@ def main():
                     raise
                 except Exception as exc:
                     raise RuntimeError(f"failed to read detection quality: {exc}") from exc
+                print("[FRONTEND MOVE CMD]", " ".join(str(x) for x in move_cmd))
                 subprocess.run(move_cmd, check=True)
                 msg = f"{suffix} ok: {run_root}"
                 last_plan = str(plan_json)
@@ -1097,8 +1525,7 @@ def main():
                 with robot_lock:
                     robot_state["busy"] = False
                     robot_state["message"] = msg
-                    if last_plan:
-                        robot_state["last_plan"] = last_plan
+                    robot_state["last_plan"] = last_plan
 
         threading.Thread(target=worker, daemon=True).start()
         return jsonify({"ok": True, "message": f"{mode} preinsert started, movej_speed={speed_config['movej_speed']}"})
@@ -1122,11 +1549,11 @@ def main():
             if robot_state["busy"]:
                 return jsonify({"ok": False, "error": "robot command already running"}), 409
             plan_path = robot_state.get("last_plan") or ""
-            if not plan_path or not Path(plan_path).exists():
-                latest = find_latest_frontend_plan(args.frontend_run_dir)
-                plan_path = str(latest) if latest else ""
             if not plan_path:
-                return jsonify({"ok": False, "error": "no previous plan found"}), 404
+                return jsonify({"ok": False, "error": "no current valid plan; run YOLO plan first"}), 404
+            if not Path(plan_path).exists():
+                robot_state["last_plan"] = ""
+                return jsonify({"ok": False, "error": f"current plan missing: {plan_path}"}), 404
             robot_state["busy"] = True
             robot_state["message"] = f"last-plan preinsert running, movej_speed={speed_config['movej_speed']}: {plan_path}"
 
@@ -1162,11 +1589,11 @@ def main():
             if robot_state["busy"]:
                 return jsonify({"ok": False, "error": "robot command already running"}), 409
             plan_path = robot_state.get("last_plan") or ""
-            if not plan_path or not Path(plan_path).exists():
-                latest = find_latest_frontend_plan(args.frontend_run_dir)
-                plan_path = str(latest) if latest else ""
             if not plan_path:
-                return jsonify({"ok": False, "error": "no previous plan found"}), 404
+                return jsonify({"ok": False, "error": "no current valid plan; run YOLO plan first"}), 404
+            if not Path(plan_path).exists():
+                robot_state["last_plan"] = ""
+                return jsonify({"ok": False, "error": f"current plan missing: {plan_path}"}), 404
             robot_state["busy"] = True
             robot_state["message"] = f"insert running, speed={speed_config['frontend_insert_speed']}: {plan_path}"
 
