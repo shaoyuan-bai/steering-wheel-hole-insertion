@@ -7,7 +7,8 @@
     "vertical_pre_release: vertical pose before table release sequence.",
     "pre_place: safe pose above the table target.",
     "place: final release pose near/on table.",
-    "retreat: safe pose after releasing and lifting away."
+    "retreat: safe pose after releasing and lifting away.",
+    "linear_pre_release: straight-line pre-release pose before final release approach."
   ],
   "poses": {
     "pre_place": {
@@ -91,6 +92,28 @@
         -149.773
       ],
       "captured_at": "2026-06-02 15:41:22"
+    },
+    "linear_pre_release": {
+      "name": "linear_pre_release",
+      "description": "Straight-line pre-release pose captured from current robot state.",
+      "pose": [
+        -0.438397,
+        0.030012,
+        0.466526,
+        2.705,
+        -0.714,
+        -2.507
+      ],
+      "joint_deg": [
+        -5.677,
+        44.426,
+        -1.406,
+        -175.194,
+        -90.361,
+        -30.466
+      ],
+      "captured_at": "2026-06-02 22:06:33"
     }
-  }
+  },
+  "updated_at": "2026-06-02 22:06:33"
 }

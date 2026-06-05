@@ -153,6 +153,7 @@ post_insert_sequence:
   onload_forward_avoid: 1
   onload_release_lift_exec_mode: 1
   onload_release_lift_height_m: 0.66
+  linear_release_base_to_arm_delay_s: 1.5
 
 post_insert_return_sequence:
   lift_exec_mode: 1
@@ -164,3 +165,4 @@ post_insert_return_sequence:
   base_speed: 1.00
   rotate_speed: 1.00
   initial_movej_speed: 100
+  linear_grasp_base_to_arm_lift_delay_s: 1.5

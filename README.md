@@ -1,156 +1,202 @@
-# 方向盘中心孔视觉插入项目
+# Steering Wheel Center-Hole Insertion
 
-本项目用于 RM65 机械臂在眼在手上的 RGBD 相机引导下，将夹爪末端插入方向盘中心金属环孔。方向盘挂在架子上时会有不同倾斜角，因此流程不是使用固定世界姿态插入，而是通过视觉识别中心孔位置，并结合 RGBD 深度拟合中心金属环附近的局部法向，让插入杆沿孔轴方向接近和插入。
+This repository contains the vision-guided insertion and transfer workflow for an RM65 robot arm, a gripper-mounted RGBD camera, a custom insertion tool, a mobile base, and a lift platform.
 
-手眼标定只是本项目中的一个必要坐标转换环节。完整流程还包括中心孔实例分割、RGBD 法向估计、杆尖 TCP 标定、运动规划、夹爪控制、急停保护和 VLA 数据采集。
+The main task is to insert the tool into the metal center hole of a steering wheel. The wheel is hanging on a rack and may be tilted differently each time, so the system does not rely on a fixed world pose. Instead, it detects the center hole, estimates the local normal from RGBD depth, transforms the target into the robot base frame through hand-eye calibration, and then executes guarded insertion and transfer motions.
 
-## 当前能力
+Chinese documentation is kept in [README.zh-CN.md](README.zh-CN.md).
 
-- 使用 YOLO11n-seg 单类模型识别 `center_hole`。
-- 使用 RGBD 点云在中心孔周围拟合局部平面，得到孔中心和法向。
-- 根据手眼矩阵将相机坐标转换到机械臂 base 坐标。
-- 根据杆尖 TCP 偏置生成预插入位姿和插入位姿。
-- 提供内网 Web 前端，可查看相机画面、YOLO 叠加、执行运动、控制夹爪、保存训练数据。
-- 提供命令行脚本用于采集、离线检测、稳定性验证、杆尖 pivot 标定。
-- 支持将 RGB 视频和机械臂关节/位姿按时间对齐保存，便于后续 VLA 数据集整理。
+## Current Capabilities
 
-## 目录结构
+- Single-class YOLO segmentation for `center_hole`.
+- RGBD-based local plane fitting around the detected metal ring to estimate hole center and normal.
+- Eye-in-hand camera to robot-base transform using the hand-eye matrix in configuration.
+- Tool-tip offset compensation through pivot calibration.
+- Web UI for camera preview, YOLO overlay, robot motion, gripper control, lift/base control, emergency stop, and VLA-style data recording.
+- RealSense camera service support to avoid multiple projects competing for the same camera device.
+- Automated insertion and loading flows, including linear pre-release and return-to-grasp sequences.
 
-核心代码位于：
+## Main Directory
+
+Most project-specific code is under:
 
 ```text
 wheel_hole_insertion/
 ```
 
-主要文件：
+Important files:
 
 ```text
-wheel_hole_insertion/config.yaml                    # 设备、标定、补偿、速度、安全参数
-wheel_hole_insertion/realsense_preview_server.py    # 内网前端服务
-wheel_hole_insertion/detect_center_hole_yolo_rgbd.py # YOLO + RGBD 中心孔识别
-wheel_hole_insertion/move_to_center_hole.py         # 运动规划与预插入执行
-wheel_hole_insertion/continue_insert_along_axis.py  # 沿当前工具轴小步插入
-wheel_hole_insertion/calibrate_insert_tip_pivot.py  # 插入杆尖 pivot 标定
-wheel_hole_insertion/capture_rgbd_once_headless.py  # 无界面采集一帧 RGBD
-wheel_hole_insertion/label_dataset/best.onnx        # 当前 YOLO-seg 推理权重
+wheel_hole_insertion/config.yaml                     # Robot, camera, calibration, offsets, speed, and safety parameters
+wheel_hole_insertion/realsense_preview_server.py     # LAN web UI and workflow server
+wheel_hole_insertion/detect_center_hole_yolo_rgbd.py # YOLO + RGBD center-hole detection
+wheel_hole_insertion/move_to_center_hole.py          # Motion planning and pre-insertion execution
+wheel_hole_insertion/continue_insert_along_axis.py   # Continue insertion along the current tool axis
+wheel_hole_insertion/calibrate_insert_tip_pivot.py   # Pivot calibration for the insertion tip
+wheel_hole_insertion/capture_rgbd_once_headless.py   # Headless RGBD capture
+wheel_hole_insertion/table_place_poses.json          # Taught placement and release poses
+wheel_hole_insertion/label_dataset/best.onnx         # Current YOLO segmentation model
 ```
 
-更详细的运行说明见：
+Camera service files:
 
 ```text
-wheel_hole_insertion/README.md
+camera_service/camera_service.py
+camera_service/cameras.json
 ```
 
-## 配置
+## Configuration
 
-所有设备相关参数集中在：
+Runtime parameters are centralized in:
 
 ```text
 wheel_hole_insertion/config.yaml
 ```
 
-其中包括：
+The file includes:
 
-- 机器人 IP、端口、初始关节位姿。
-- 手眼矩阵 `hand_eye.matrix`。
-- 杆尖 TCP 偏置 `tool.tip_tcp_m`。
-- 视觉补偿 `observed_right_offset_m` / `observed_up_offset_m`。
-- 预插入距离、插入距离、安全阈值。
-- 相机分辨率、YOLO 权重路径、置信度阈值。
-- 前端速度、夹爪参数、VLA 数据保存路径。
+- Robot IP, port, and initial joint pose.
+- Hand-eye transform under `hand_eye.matrix`.
+- Tool-tip offset under `tool.tip_tcp_m`.
+- Visual correction offsets under `insertion`.
+- Pre-insertion, insertion, and safety limits.
+- Camera resolution and YOLO model path.
+- Gripper parameters.
+- Mobile base and lift platform endpoints and speeds.
+- Automated workflow distances, heights, and delay values.
 
-当前摄像头曾被撞歪，因此配置中默认：
-
-```yaml
-hand_eye:
-  valid: false
-```
-
-在重新完成手眼标定前，真实运动脚本会拒绝执行，避免继续使用旧矩阵。重新标定后，将新的矩阵写入 `hand_eye.matrix`，并设置：
+Hand-eye calibration validity is controlled by:
 
 ```yaml
 hand_eye:
   valid: true
 ```
 
-## 启动前端
+If the camera, gripper, or tool mount is moved or hit, redo or verify the hand-eye calibration and tool-tip pivot calibration before running insertion motions.
 
-推荐现场使用前端：
+## Start the Web UI
+
+Use the `cyy` environment:
 
 ```bash
 cd /home/wooshrobot/bai/hand_eye_calibration
 /home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/realsense_preview_server.py
 ```
 
-浏览器访问：
+Open in a browser:
 
 ```text
-http://<设备IP>:8090
+http://<device-ip>:8090
 ```
 
-前端功能：
+The web UI provides:
 
-- 实时查看 RealSense 彩色画面。
-- 切换 YOLO 识别叠加图。
-- 回到初始位。
-- 执行法向对齐、预插入、小步插入。
-- 一键执行自动流程：法向对齐、按计划预插入、4 次 10mm 插入、打开夹爪、升降机上升 0.02m、底盘后退 0.3m。
-- 控制夹爪开合。
-- 调整运动速度。
-- 保存 RGB 视频和机械臂状态数据。
+- RealSense RGB preview.
+- Optional YOLO overlay.
+- Initial-pose return.
+- Normal alignment.
+- Planned pre-insertion.
+- Manual 10 mm insertion step.
+- Gripper open/close.
+- Lift and mobile-base controls.
+- Emergency stop for robot and mobile platform requests.
+- VLA-style recording of synchronized video and robot state.
 
-## 典型流程
+## Current Automated Workflows
 
-1. 固定相机和插入杆，完成手眼标定并更新 `config.yaml`。
-2. 使用 `calibrate_insert_tip_pivot.py` 标定插入杆尖相对 TCP 的偏置。
-3. 启动前端，确认中心孔在画面中且 YOLO 识别稳定。
-4. 执行法向对齐姿态调试。
-5. 执行预插入，人工确认杆尖是否对准中心孔。
-6. 沿当前工具轴小步插入。
-7. 如需训练 VLA，点击前端保存按钮记录视频和机械臂状态。
+### Steering Wheel Loading
 
-## 当前自动流程
+The `抓取方向盘上料` button runs the full loading sequence. The current implementation performs:
 
-前端按钮“自动对齐插入”会连续执行：
+1. Close gripper.
+2. Capture RGBD and detect the steering-wheel center hole.
+3. Align tool orientation to the estimated hole normal.
+4. Move to the planned pre-insertion pose.
+5. Insert once by 40 mm along the current tool axis.
+6. Open gripper.
+7. Lift up by 0.02 m.
+8. Move the base backward.
+9. Move the arm to the vertical pre-release pose.
+10. Move lift and base/arm through the configured release sequence.
 
-1. 保存当前 RGBD 并识别方向盘中心孔。
-2. 执行法向对齐姿态。
-3. 使用刚生成的计划移动到预插入位置。
-4. 沿当前工具轴插入 10mm，重复 4 次，每次间隔 1 秒。
-5. 打开夹爪。
-6. 调用升降机接口上升 0.02m。
-7. 调用底盘前后移动接口，传参 `distance=-0.3` 后退 0.3m。
+Exact distances, heights, speeds, and safety checks are configured in `wheel_hole_insertion/config.yaml`.
 
-该流程仍然依赖当前 `wheel_hole_insertion/config.yaml` 中的手眼矩阵、杆尖 TCP、视觉补偿、运动速度和底盘/升降机接口配置。
+### Linear Pre-Release Loading
 
-## 离线检测
+The `直线待释放上料` button runs a variant that uses the taught pose:
 
-采集一帧 RGBD：
+```text
+poses.linear_pre_release
+```
+
+The current sequence is:
+
+1. Close gripper.
+2. Capture RGBD and detect the center hole.
+3. Align to the estimated hole normal.
+4. Move to planned pre-insertion.
+5. Insert once by 40 mm.
+6. Open gripper.
+7. Lift up by 0.02 m.
+8. Start base backward motion and lift-to-0.7 motion, then start arm motion to `linear_pre_release` after `post_insert_sequence.linear_release_base_to_arm_delay_s`.
+9. Lower lift to 0.545.
+10. Close gripper.
+
+### Return to Linear Grasp
+
+The `返回直线夹取` button runs:
+
+1. Lift up by 0.03 m.
+2. Send the mobile-base forward 2 m request.
+3. After `post_insert_return_sequence.linear_grasp_base_to_arm_lift_delay_s`, move the arm to the initial pose while moving the lift to 0.7.
+4. Wait for the base request to finish.
+
+## Offline RGBD Capture and Detection
+
+Capture one RGBD sample:
 
 ```bash
 /home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/capture_rgbd_once_headless.py
 ```
 
-对采集结果运行识别：
+Run detection:
 
 ```bash
-/home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/detect_center_hole_yolo_rgbd.py <RGBD采集目录>
+/home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/detect_center_hole_yolo_rgbd.py <rgbd_capture_dir>
 ```
 
-输出包含：
+Outputs include:
 
-- `*_detection.json`
-- `*_overlay.png`
+```text
+*_detection.json
+*_overlay.png
+```
 
-## 数据保存
+## Tool-Tip Pivot Calibration
 
-前端“开始保存 / 停止保存”会按 episode 保存数据，默认目录：
+Run:
+
+```bash
+/home/wooshrobot/miniconda3/envs/cyy/bin/python wheel_hole_insertion/calibrate_insert_tip_pivot.py
+```
+
+Keep the physical insertion point fixed while moving the arm through multiple orientations. The script writes the calibrated tip offset to:
+
+```text
+wheel_hole_insertion/insert_tip_pivot_calibration.json
+```
+
+Copy the validated value into `tool.tip_tcp_m` in `config.yaml`.
+
+## VLA-Style Data Recording
+
+The web UI can record synchronized RGB video and robot state. Episodes are saved under:
 
 ```text
 wheel_hole_insertion/vla_recordings/
 ```
 
-单个 episode 结构：
+Typical structure:
 
 ```text
 episode_000000/
@@ -161,11 +207,12 @@ episode_000000/
   meta/tasks.jsonl
 ```
 
-视频帧和机械臂状态通过同一个 `frame_index` 对齐。
+Video frames and robot state records are aligned by `frame_index`.
 
-## 安全说明
+## Safety Notes
 
-- 当前手眼矩阵无效时，运动脚本默认拒绝执行。
-- 运动过程中可使用急停按钮，或在命令行模式按 `s`、空格、回车、`q` 停止。
-- 插入前必须人工确认 overlay、中心孔位置、法向和杆尖实际位置。
-- 如果相机、夹爪、插入杆发生碰撞或松动，需要重新确认手眼标定和杆尖 TCP 标定。
+- Confirm the YOLO overlay, center-hole location, normal direction, and physical tip alignment before insertion.
+- Recalibrate hand-eye and tool-tip offset after any camera/tool collision or mount change.
+- Use the web emergency stop button if motion becomes unsafe.
+- Do not run automated insertion if `hand_eye.valid` is false or if the current setup does not match the saved calibration.
+- The mobile-base and lift APIs are external services; if concurrent behavior looks serialized, inspect the service at `mobile_base.base_url`.
